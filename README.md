@@ -5,7 +5,7 @@ Kutch, Gujarat). The grid is built from the real bead shape and weave geometry,
 so what the designer draws on screen is what the artisan weaves — no more
 squished designs from square-pixel grids.
 
-Live: https://part-time-artist.github.io/Beadwork-3-tech/
+Live: https://part-time-artist.github.io/crossstitch/
 
 ```
 npm run dev      # Vite dev server (http://localhost:3000)
