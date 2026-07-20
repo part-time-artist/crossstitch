@@ -7,6 +7,7 @@
 // ~/.claude/plans/distinch-and-with-outlines-curried-eich.md.
 
 import { getTechnique } from '../techniques'
+import { decodeBead } from './beadValue'
 
 export const PX_PER_MM = 11.81 // ~300 DPI raster
 export const A4 = { w: 210, h: 297 } // mm
@@ -56,7 +57,8 @@ export function drawBeads(ctx, { geo, beads, cols, rows, tiltFor, tech }) {
     for (let col = 0; col < cols; col++) {
       if (!tech.beadExists(col, row)) continue
       const { cx, cy } = geo.centerFor(col, row)
-      const fill = beads.get(key(col, row))
+      const raw = beads.get(key(col, row))
+      const { color: fill, style } = raw ? decodeBead(raw) : { color: null, style: 'cross' }
       const tilt = tiltFor(col, row)
       // faint cell outline first so every cell stays countable on paper, like
       // graph paper (locked decision #2); the stitch mark is drawn on top.
@@ -66,7 +68,7 @@ export function drawBeads(ctx, { geo, beads, cols, rows, tiltFor, tech }) {
       ctx.stroke()
       if (fill) {
         if (tech.fillBead) {
-          tech.fillBead(ctx, cx, cy, geo.Bw, geo.Bh, fill, tilt)
+          tech.fillBead(ctx, cx, cy, geo.Bw, geo.Bh, fill, tilt, style)
         } else {
           ctx.fillStyle = fill
           ctx.fill()
@@ -172,9 +174,15 @@ export function renderFullChart({
 }
 
 // --- colour legend ------------------------------------------------------------
+// Grouped by actual colour, regardless of stitch style (locked decision #7:
+// "swatch + total bead count per colour" — a cross and a line stitch of the
+// same thread colour are one legend entry, not two).
 export function tallyColors(beads) {
   const m = new Map()
-  for (const v of beads.values()) m.set(v, (m.get(v) || 0) + 1)
+  for (const v of beads.values()) {
+    const { color } = decodeBead(v)
+    m.set(color, (m.get(color) || 0) + 1)
+  }
   return [...m.entries()]
     .map(([color, count]) => ({ color, count }))
     .sort((a, b) => b.count - a.count)

@@ -9,6 +9,11 @@ import {
   getMeta,
   setMeta,
 } from './lib/store'
+import {
+  IconDraw, IconErase, IconSelect, IconLayers,
+  IconEye, IconEyeOff, IconLock, IconUnlock,
+} from './icons'
+import { encodeBead, decodeBead } from './lib/beadValue'
 
 // ---- design tokens: charcoal "reown"-style chrome (see cross stitch references/
 // ui reference.png). Dark rounded panels, monospace UPPERCASE labels, one blue
@@ -159,11 +164,18 @@ export default function Home() {
   const firstLayerRef = useRef(null)
   if (!firstLayerRef.current) firstLayerRef.current = makeLayer('Layer 1')
   const [layers, setLayers] = useState(() => [firstLayerRef.current])
+  // Procreate-style folders in the layers panel: {id,name,visible,locked,collapsed}.
+  // Member layers carry a matching `groupId` and MUST stay contiguous in
+  // z-order (every group op below preserves that; there's no drag-reorder in
+  // this app yet, so ↑/↓ move is simply disabled on grouped layers rather
+  // than risk splitting a group).
+  const [groups, setGroups] = useState([])
   const [activeId, setActiveId] = useState(() => firstLayerRef.current.id)
   const [beads, setBeads] = useState(() => firstLayerRef.current.beads)
   const [showLayers, setShowLayers] = useState(false)
   const [tool, setTool] = useState('draw') // draw | erase | select
   const [color, setColor] = useState('#F3CEDE') // starts on the palette's pink
+  const [stitchStyle, setStitchStyle] = useState('cross') // 'cross' | 'line' — the brush's active stitch shape
   const [pack, setPack] = useState(0.75) // 0 = spaced (true size) … 1 = max packed; 0.75 ≈ touching
   const [brush, setBrush] = useState(1) // brush radius in beads
   const [recentColors, setRecentColors] = useState([]) // up to 5 recently used
@@ -185,6 +197,8 @@ export default function Home() {
   // is always the active layer's Map; layersRef is the whole stack.
   const layersRef = useRef(null)
   if (!layersRef.current) layersRef.current = layers
+  const groupsRef = useRef(null)
+  if (!groupsRef.current) groupsRef.current = groups
   const activeIdRef = useRef(activeId)
   // the active layer can be edited only when it is visible and unlocked; the
   // ref lets pointer handlers (closures) read the latest value
@@ -192,6 +206,7 @@ export default function Home() {
   const undoStack = useRef([])
   const redoStack = useRef([])
   const strokeBase = useRef(null) // beads Map at stroke start
+  const strokeWorking = useRef(null) // private mutable clone for the CURRENT stroke (freehand path)
   const patternBaseRef = useRef(null) // beads before the last pattern apply (see makePattern)
 
   // Repaint the canvas straight from beadsRef on the next animation frame —
@@ -200,14 +215,43 @@ export default function Home() {
   // the tab killed on iPad Safari.
   const rafRef = useRef(0)
   const drawRef = useRef(null) // latest drawScene (assigned every render below)
+  // Zoom/pan performance: while a gesture is live, skip the full per-cell
+  // redraw (expensive with the jat bezier stitch) and blit the last full
+  // render instead — see drawBlit/updateSceneCache below, assigned to refs
+  // every render so this stable callback always calls the latest closure.
+  const sceneCacheRef = useRef(null) // offscreen canvas holding the last full render
+  const cacheViewRef = useRef(null) // the view {scale,tx,ty,rot} it was drawn at
+  const interactingRef = useRef(false) // true while a pan/zoom/pinch gesture is live
+  const interactTimerRef = useRef(0)
+  const drawBlitRef = useRef(null) // latest drawBlit (assigned every render below)
+  const updateSceneCacheRef = useRef(null) // latest updateSceneCache (assigned every render below)
   const requestRedraw = useCallback(() => {
     if (rafRef.current) return
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = 0
       const canvas = canvasRef.current
-      if (canvas && drawRef.current) drawRef.current(canvas.getContext('2d'))
+      if (!canvas) return
+      const ctx = canvas.getContext('2d')
+      if (interactingRef.current && sceneCacheRef.current && drawBlitRef.current) {
+        drawBlitRef.current(ctx)
+      } else if (drawRef.current) {
+        drawRef.current(ctx)
+        if (updateSceneCacheRef.current) updateSceneCacheRef.current(canvas)
+      }
     })
   }, [])
+  // Marks a gesture as "live" so requestRedraw takes the fast blit path; after
+  // ~130ms of no calls it flips back and forces one crisp full render (which
+  // also refreshes the cache). Area revealed mid-gesture beyond the old cached
+  // viewport is blank until that settle — invisible for a normal quick gesture.
+  const beginInteract = useCallback(() => {
+    interactingRef.current = true
+    clearTimeout(interactTimerRef.current)
+    interactTimerRef.current = setTimeout(() => {
+      interactingRef.current = false
+      requestRedraw()
+    }, 130)
+  }, [requestRedraw])
 
   // SINGLE write path for the design Map. beadsRef is advanced SYNCHRONOUSLY,
   // never via an effect: React renders lag behind fast pencil events, so a new
@@ -242,7 +286,7 @@ export default function Home() {
   // bead Maps are immutable (replaced on change), so a snapshot just shares the
   // unchanged Map references — cheap, like the single-Map snapshots before.
   // currentDoc reads the LIVE refs (never stale React state).
-  const currentDoc = () => ({ layers: layersRef.current, activeId: activeIdRef.current })
+  const currentDoc = () => ({ layers: layersRef.current, activeId: activeIdRef.current, groups: groupsRef.current })
   const docBeads = (doc) => {
     let t = 0
     for (const l of doc.layers) t += l.beads.size
@@ -252,11 +296,13 @@ export default function Home() {
   // Restore a document snapshot into both the live refs and React state.
   const applyDoc = (doc) => {
     layersRef.current = doc.layers
+    groupsRef.current = doc.groups || []
     const active = doc.layers.find((l) => l.id === doc.activeId) || doc.layers[0]
     activeIdRef.current = active ? active.id : null
     beadsRef.current = active ? active.beads : new Map()
     patternBaseRef.current = null
     setLayers(doc.layers)
+    setGroups(groupsRef.current)
     setActiveId(activeIdRef.current)
     setBeads(beadsRef.current)
     setSelection(new Set())
@@ -379,11 +425,16 @@ export default function Home() {
     setPlacing(null)
   }
 
-  // dir +1 = move up toward the top, -1 = down toward the bottom
+  // dir +1 = move up toward the top, -1 = down toward the bottom. Grouped
+  // layers don't move individually — there's no drag-reorder yet, so moving
+  // one out of its contiguous block would corrupt the group; Group/Ungroup
+  // is the only way to change a grouped layer's position.
   const moveLayer = (id, dir) => {
     const idx = layersRef.current.findIndex((l) => l.id === id)
+    if (layersRef.current[idx]?.groupId) return
     const j = idx + dir
     if (j < 0 || j >= layersRef.current.length) return
+    if (layersRef.current[j]?.groupId) return
     pushHistory(currentDoc())
     const nl = [...layersRef.current]
     const [m] = nl.splice(idx, 1)
@@ -409,8 +460,139 @@ export default function Home() {
     setLayers(nl)
   }
 
+  // ---- layer GROUPS (Procreate-style folders) -------------------------------
+  // Model stays a flat `layers` array (every hot path above is untouched);
+  // `groups` is a small parallel list and members carry a matching `groupId`.
+  // Content changes (group/ungroup/flatten) are one undo step, like the layer
+  // ops above; visibility/lock/rename/collapse are metadata (not undoable),
+  // same policy as the per-layer toggles.
+  const guid = () => 'g_' + uid()
+
+  // Group the layer with the one directly BELOW it: joins that layer's group
+  // if it has one, else forms a new group. Only offered on an ungrouped layer
+  // (see the Group button's disabled condition) so this always just extends
+  // a contiguous block by one — never needs to reorder anything.
+  const groupWithBelow = (id) => {
+    const idx = layersRef.current.findIndex((l) => l.id === id)
+    if (idx <= 0) return
+    const layer = layersRef.current[idx]
+    if (layer.groupId) return
+    const below = layersRef.current[idx - 1]
+    pushHistory(currentDoc())
+    let gid = below.groupId
+    let ng = groupsRef.current
+    // below has no group yet: form a new one and tag BOTH layers (below
+    // wasn't grouped before, so it needs the id too, not just the active one)
+    const alsoTagBelow = !gid
+    if (!gid) {
+      gid = guid()
+      ng = [...groupsRef.current, { id: gid, name: 'Group', visible: true, locked: false, collapsed: false }]
+    }
+    const nl = layersRef.current.map((l) =>
+      (l.id === id || (alsoTagBelow && l.id === below.id)) ? { ...l, groupId: gid } : l
+    )
+    layersRef.current = nl
+    groupsRef.current = ng
+    setLayers(nl)
+    setGroups(ng)
+  }
+
+  const ungroupLayer = (id) => {
+    const layer = layersRef.current.find((l) => l.id === id)
+    if (!layer || !layer.groupId) return
+    pushHistory(currentDoc())
+    const gid = layer.groupId
+    const nl = layersRef.current.map((l) => (l.id === id ? { ...l, groupId: undefined } : l))
+    const stillUsed = nl.some((l) => l.groupId === gid)
+    const ng = stillUsed ? groupsRef.current : groupsRef.current.filter((g) => g.id !== gid)
+    layersRef.current = nl
+    groupsRef.current = ng
+    setLayers(nl)
+    setGroups(ng)
+  }
+
+  // Merge a group's bead layers top-wins into ONE layer at the bottom
+  // member's slot — same rule as mergeDown, one undo step.
+  const flattenGroup = (gid) => {
+    const idxs = layersRef.current.map((l, i) => (l.groupId === gid ? i : -1)).filter((i) => i >= 0)
+    if (idxs.length < 2) return
+    pushHistory(currentDoc())
+    const merged = new Map()
+    for (const i of idxs) for (const [k, v] of layersRef.current[i].beads) merged.set(k, v)
+    const g = groupsRef.current.find((x) => x.id === gid)
+    const flat = makeLayer(g ? g.name : 'Group', merged)
+    const nl = []
+    let inserted = false
+    for (const l of layersRef.current) {
+      if (l.groupId === gid) {
+        if (!inserted) { nl.push(flat); inserted = true }
+        continue
+      }
+      nl.push(l)
+    }
+    const ng = groupsRef.current.filter((x) => x.id !== gid)
+    layersRef.current = nl
+    groupsRef.current = ng
+    setLayers(nl)
+    setGroups(ng)
+    makeActive(flat)
+    setSelection(new Set())
+    setPlacing(null)
+  }
+
+  const toggleGroupVisible = (gid) => {
+    const ng = groupsRef.current.map((g) => (g.id === gid ? { ...g, visible: !g.visible } : g))
+    groupsRef.current = ng
+    setGroups(ng)
+    requestRedraw()
+  }
+  const toggleGroupLocked = (gid) => {
+    const ng = groupsRef.current.map((g) => (g.id === gid ? { ...g, locked: !g.locked } : g))
+    groupsRef.current = ng
+    setGroups(ng)
+  }
+  const toggleGroupCollapsed = (gid) => {
+    const ng = groupsRef.current.map((g) => (g.id === gid ? { ...g, collapsed: !g.collapsed } : g))
+    groupsRef.current = ng
+    setGroups(ng)
+  }
+  const renameGroup = (gid, name) => {
+    const ng = groupsRef.current.map((g) => (g.id === gid ? { ...g, name } : g))
+    groupsRef.current = ng
+    setGroups(ng)
+  }
+
+  // effective visibility = the layer's own flag AND its group's (ungrouped ⇒ just its own)
+  const layerVisible = (l, gs) => l.visible && (!l.groupId || gs.find((g) => g.id === l.groupId)?.visible !== false)
+
+  // Small live-render preview for a layers-panel row — same flat-colour-block
+  // approach as the gallery card thumbnail (see makeThumb above), just sized
+  // for the panel and scoped to one layer's own beads (cheap: only iterates
+  // that layer's placed beads, not the whole grid).
+  const LP_THUMB_W = 34
+  const LP_THUMB_H = 24
+  const layerThumb = (l) => {
+    if (!l.beads.size || !cols || !rows) return null
+    const canvas = document.createElement('canvas')
+    canvas.width = LP_THUMB_W
+    canvas.height = LP_THUMB_H
+    const ctx = canvas.getContext('2d')
+    const s = Math.min(LP_THUMB_W / cols, LP_THUMB_H / rows)
+    const ox = (LP_THUMB_W - cols * s) / 2
+    const oy = (LP_THUMB_H - rows * s) / 2
+    const cell = Math.max(1, Math.ceil(s))
+    for (const [k, v] of l.beads) {
+      const [c, r] = k.split(',').map(Number)
+      ctx.fillStyle = decodeBead(v).color
+      ctx.fillRect(ox + c * s, oy + r * s, cell, cell)
+    }
+    return canvas.toDataURL('image/png')
+  }
+
   const activeLayer = layers.find((l) => l.id === activeId) || null
-  const canEdit = !!activeLayer && activeLayer.visible && !activeLayer.locked
+  const activeGroup = activeLayer?.groupId ? groups.find((g) => g.id === activeLayer.groupId) : null
+  const canEdit = !!activeLayer && activeLayer.visible && !activeLayer.locked &&
+    (!activeGroup || (activeGroup.visible !== false && !activeGroup.locked))
   canEditRef.current = canEdit
 
   // Per-cell tilt (radians) — defined by the technique (3-bead woven tilt /
@@ -480,9 +662,10 @@ export default function Home() {
   const floodFill = useCallback(
     (cell, useColor = color) => {
       if (!cell || !canEditRef.current) return
+      const useVal = encodeBead(useColor, stitchStyle)
       commit((prev) => {
         const target = prev.get(key(cell.col, cell.row)) || null
-        if (target === useColor) return prev
+        if (target === useVal) return prev
         const next = new Map(prev)
         const stack = [cell]
         const seen = new Set()
@@ -494,15 +677,15 @@ export default function Home() {
           if (seen.has(k)) continue
           seen.add(k)
           const cur = prev.get(k) || null
-          if (cur !== target) continue // boundary: stop at differently-colored beads
-          next.set(k, useColor)
+          if (cur !== target) continue // boundary: stop at differently-colored/styled beads
+          next.set(k, useVal)
           // technique-defined neighbours (3-bead staggered / 1-bead orthogonal)
           for (const n of tech.floodNeighbors(col, row)) stack.push(n)
         }
         return next
       })
     },
-    [color, cols, rows, commit, tech]
+    [color, stitchStyle, cols, rows, commit, tech]
   )
 
   // beads covered by the brush at doc point (x,y): the bead under the cursor for
@@ -538,21 +721,31 @@ export default function Home() {
     (x, y, mode) => {
       const cells = brushCells(x, y)
       if (!cells.length) return
+      const val = encodeBead(color, stitchStyle)
       applyBeads((prev) => {
-        let next = null
+        // Freehand strokes call this on every pointer event (up to ~240Hz).
+        // Clone the stroke's base Map ONCE (lazily, on the first real change)
+        // and keep mutating that same private copy in place for the rest of
+        // the stroke, instead of `new Map(prev)` on every event — that clone
+        // was the dominant per-event cost on a dense design. Reset at stroke
+        // start/end (onPointerDown / endDrag).
+        let next = strokeWorking.current
         for (const { col, row } of cells) {
           const k = key(col, row)
           if (mode === 'erase') {
-            if ((next || prev).has(k)) { next = next || new Map(prev); next.delete(k) }
-          } else if ((next || prev).get(k) !== color) {
-            next = next || new Map(prev)
-            next.set(k, color)
+            if ((next || prev).has(k)) {
+              if (!next) { next = new Map(prev); strokeWorking.current = next }
+              next.delete(k)
+            }
+          } else if ((next || prev).get(k) !== val) {
+            if (!next) { next = new Map(prev); strokeWorking.current = next }
+            next.set(k, val)
           }
         }
         return next || prev
       }, true) // silent: strokes repaint via rAF, no React render per event
     },
-    [brushCells, color, applyBeads]
+    [brushCells, color, stitchStyle, applyBeads]
   )
 
   // ---- selection (marquee Select tool) ----
@@ -589,7 +782,13 @@ export default function Home() {
     pushRecent(color)
     commit((prev) => {
       const next = new Map(prev)
-      for (const k of selection) next.set(k, color)
+      // Recolour changes the colour only — the stitch KEEPS whatever shape
+      // (cross/line) it already had, matching the current tool's stitchStyle
+      // would silently reshape stitches the user never asked to reshape.
+      for (const k of selection) {
+        const { style } = decodeBead(prev.get(k))
+        next.set(k, encodeBead(color, style))
+      }
       return next
     })
   }
@@ -755,7 +954,12 @@ export default function Home() {
   useEffect(() => {
     const onKey = (e) => {
       if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== 'z') return
-      if (e.target !== document.body) return // don't steal from inputs
+      // Only skip real text fields — the old guard required e.target ===
+      // document.body, which silently swallowed undo any time focus sat on a
+      // button (zoom control, tool strip, "+ New artwork", ...) since clicking
+      // ANY button moves focus off body.
+      const t = e.target
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
       e.preventDefault()
       if (e.shiftKey) redo()
       else undo()
@@ -866,7 +1070,7 @@ export default function Home() {
       // own Maps from `layers` state (they can't change mid-stroke). `beads`
       // stays in the deps so committed active-layer edits still trigger redraw.
       const liveBeads = beadsRef.current
-      const visLayers = layers.filter((l) => l.visible)
+      const visLayers = layers.filter((l) => layerVisible(l, groups))
       const aId = activeId
       const fillAt = (k) => {
         for (let i = visLayers.length - 1; i >= 0; i--) {
@@ -916,8 +1120,9 @@ export default function Home() {
       for (let row = r0; row < r1; row++) {
         for (let col = c0; col < c1; col++) {
           if (!tech.beadExists(col, row)) continue
-          const fill = fillAt(key(col, row))
-          if (!fill) continue
+          const raw = fillAt(key(col, row))
+          if (!raw) continue
+          const { color: fill, style: fillStyle } = decodeBead(raw)
           const { cx, cy } = geo.centerFor(col, row)
           if (simple) {
             ctx.fillStyle = fill
@@ -926,7 +1131,7 @@ export default function Home() {
           }
           const tilt = tiltFor(col, row)
           if (tech.fillBead) {
-            tech.fillBead(ctx, cx, cy, dw, dh, fill, tilt)
+            tech.fillBead(ctx, cx, cy, dw, dh, fill, tilt, fillStyle)
           } else {
             tech.beadPath(ctx, cx, cy, dw, dh, tilt)
             ctx.fillStyle = fill
@@ -964,7 +1169,9 @@ export default function Home() {
         ctx.setLineDash([])
       }
 
-      // ghost of the duplicated motif awaiting placement (drag moves it)
+      // ghost of the duplicated motif awaiting placement (drag moves it) — a
+      // plain tinted cell outline (not the real stitch shape) is enough for a
+      // drag preview, but still needs the raw value decoded to a real CSS colour
       if (placing) {
         ctx.globalAlpha = 0.55
         for (const { dc, dr, fill } of placing.motif) {
@@ -973,15 +1180,55 @@ export default function Home() {
           if (c < 0 || c >= cols || r < 0 || r >= rows || !tech.beadExists(c, r)) continue
           const { cx, cy } = geo.centerFor(c, r)
           tech.beadPath(ctx, cx, cy, dw, dh, tiltFor(c, r))
-          ctx.fillStyle = fill
+          ctx.fillStyle = decodeBead(fill).color
           ctx.fill()
         }
         ctx.globalAlpha = 1
       }
     },
-    [viewport, view, geo, beads, layers, activeId, bg, bgT, bgShown, Bw, Bh, cols, rows, tiltFor, checkerTile, DPR, selection, marquee, pack, placing, tech]
+    [viewport, view, geo, beads, layers, groups, activeId, bg, bgT, bgShown, Bw, Bh, cols, rows, tiltFor, checkerTile, DPR, selection, marquee, pack, placing, tech]
   )
   drawRef.current = drawScene // the rAF repaint path always uses the latest
+
+  // Device-pixel transform matrix matching drawScene's ctx.setTransform (same
+  // scale·R(rot)+t baked in), so a cached raster can be re-projected onto a
+  // NEW view without touching any bead.
+  const devMat = (v) => {
+    const c = Math.cos(v.rot || 0), s = Math.sin(v.rot || 0)
+    return new DOMMatrix([
+      DPR * v.scale * c, DPR * v.scale * s,
+      -DPR * v.scale * s, DPR * v.scale * c,
+      v.tx * DPR, v.ty * DPR,
+    ])
+  }
+  // Blit the last full render through the transform DELTA between the view it
+  // was cached at and the current view — one drawImage instead of iterating
+  // every placed stitch. Falls back to a full render if there's no cache yet.
+  const drawBlit = (ctx) => {
+    const cache = sceneCacheRef.current
+    if (!cache || !cacheViewRef.current) { drawScene(ctx); return }
+    const canvas = ctx.canvas
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    const m = devMat(view).multiply(devMat(cacheViewRef.current).invertSelf())
+    ctx.setTransform(m)
+    ctx.drawImage(cache, 0, 0)
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+  }
+  drawBlitRef.current = drawBlit
+
+  const updateSceneCache = (canvas) => {
+    let cache = sceneCacheRef.current
+    if (!cache || cache.width !== canvas.width || cache.height !== canvas.height) {
+      cache = document.createElement('canvas')
+      cache.width = canvas.width
+      cache.height = canvas.height
+      sceneCacheRef.current = cache
+    }
+    cache.getContext('2d').drawImage(canvas, 0, 0)
+    cacheViewRef.current = view
+  }
+  updateSceneCacheRef.current = updateSceneCache
 
   // size the canvas to the viewport (never to the document)
   useEffect(() => {
@@ -993,11 +1240,11 @@ export default function Home() {
     canvas.style.height = `${viewport.h}px`
   }, [viewport, DPR])
 
-  // redraw whenever the scene changes
+  // redraw whenever the scene changes — through requestRedraw so this shares
+  // the same fast-blit/full-render chooser as the stroke rAF path
   useEffect(() => {
-    const canvas = canvasRef.current
-    if (canvas) drawScene(canvas.getContext('2d'))
-  }, [drawScene])
+    requestRedraw()
+  }, [drawScene, requestRedraw])
 
   // fit the document into the viewport, centred
   const fitView = useCallback(() => {
@@ -1049,11 +1296,12 @@ export default function Home() {
         imageZoomAtRef.current(e.deltaY < 0 ? 1.08 : 1 / 1.08, sx, sy)
         return
       }
+      beginInteract()
       zoomAt(e.deltaY < 0 ? 1.12 : 1 / 1.12, sx, sy)
     }
     canvas.addEventListener('wheel', onWheel, { passive: false })
     return () => canvas.removeEventListener('wheel', onWheel)
-  }, [zoomAt])
+  }, [zoomAt, beginInteract])
 
   // ---- pointer interaction ----
   const dragging = useRef(false)
@@ -1168,12 +1416,13 @@ export default function Home() {
   // Rebuild the design as (stroke-start state) + brush applied at each point.
   // Used to repaint the whole stroke as a clean line, or replay it freehand.
   const paintAlong = (base, points) => {
+    const val = encodeBead(color, stitchStyle)
     const next = new Map(base)
     for (const q of points) {
       for (const { col, row } of brushCells(q.x, q.y)) {
         const k = key(col, row)
         if (tool === 'erase') next.delete(k)
-        else next.set(k, color)
+        else next.set(k, val)
       }
     }
     return next
@@ -1193,6 +1442,7 @@ export default function Home() {
         if (s.snapped && n === s.lastN) return
         s.snapped = true
         s.lastN = n
+        strokeWorking.current = null // paintAlong rebuilds from strokeBase; invalidate any freehand accumulator
         applyBeads(paintAlong(strokeBase.current, lineSamples(s.start, snap)), true)
         return
       }
@@ -1200,6 +1450,7 @@ export default function Home() {
         // was a snapped line, now curving: give back the freehand path
         s.snapped = false
         s.locked = true
+        strokeWorking.current = null // same: paintAlong replaces beadsRef.current wholesale
         applyBeads(paintAlong(strokeBase.current, s.pts), true)
         return
       }
@@ -1213,6 +1464,10 @@ export default function Home() {
   const onPointerDown = (e) => {
     e.preventDefault()
     canvasRef.current.setPointerCapture?.(e.pointerId)
+    // Blur any focused text field so its native undo (e.g. resizing a canvas-cm
+    // Pill back to a prior value) can't fire instead of ours on Ctrl/⌘+Z.
+    const ae = document.activeElement
+    if (ae && ae !== document.body && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) ae.blur()
     if (e.pointerType === 'touch') {
       if (dragging.current || marqueeRef.current) return // palm while pencil draws
       const p = ptFromEvent(e)
@@ -1245,6 +1500,7 @@ export default function Home() {
     if (!canEditRef.current) return // active layer hidden or locked — no painting
     dragging.current = true
     strokeBase.current = beadsRef.current // history: snapshot at stroke start
+    strokeWorking.current = null // fresh per-stroke mutable clone, cloned lazily on first change
     strokeRef.current = { start: p, pts: [], locked: false, snapped: false, lastN: -1 }
     if (tool === 'draw') pushRecent(color)
     paintBrush(p.x, p.y, tool)
@@ -1286,6 +1542,7 @@ export default function Home() {
             }
           })
         } else {
+          beginInteract()
           setView((v) => {
             const ns = clampNum(v.scale * (dist / g.dist), 0.02, 8)
             const nrot = (v.rot || 0) + (ang - g.ang) // snap happens on lift, not per-frame
@@ -1316,6 +1573,7 @@ export default function Home() {
         const ddy = (-s * dx + c * dy) / view.scale
         setBgT((t) => ({ ...t, x: t.x + ddx, y: t.y + ddy }))
       } else {
+        beginInteract()
         setView((v) => ({ ...v, tx: v.tx + dx, ty: v.ty + dy }))
       }
       return
@@ -1507,7 +1765,7 @@ export default function Home() {
   const flattenVisible = () => {
     const m = new Map()
     for (const l of layersRef.current) {
-      if (!l.visible) continue
+      if (!layerVisible(l, groupsRef.current)) continue
       for (const [k, v] of l.beads) m.set(k, v)
     }
     return m
@@ -1563,12 +1821,61 @@ export default function Home() {
   const [artworks, setArtworks] = useState([]) // lightweight gallery summaries
   const [currentArtworkId, setCurrentArtworkId] = useState(null)
 
+  // ---- gallery card long-press menu (Rename/Duplicate/Delete) ----
+  // Tap opens the artwork; a ~450ms hold (or right-click on desktop) opens a
+  // floating menu instead — Procreate-style, matches the beadwork tool's
+  // dashboard so gallery cards stay clean (no always-visible action buttons).
+  const [artMenu, setArtMenu] = useState(null) // { id, x, y } | null
+  const longPressTimer = useRef(0)
+  const longPressFired = useRef(false)
+  const longPressStart = useRef({ x: 0, y: 0 })
+  const LONG_PRESS_MS = 450
+  const LONG_PRESS_CANCEL_PX = 10
+
+  const onCardPointerDown = (id, e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    longPressFired.current = false
+    longPressStart.current = { x: e.clientX, y: e.clientY }
+    clearTimeout(longPressTimer.current)
+    longPressTimer.current = setTimeout(() => {
+      longPressFired.current = true
+      setArtMenu({ id, x: e.clientX, y: e.clientY })
+    }, LONG_PRESS_MS)
+  }
+  const onCardPointerMove = (e) => {
+    const dx = e.clientX - longPressStart.current.x
+    const dy = e.clientY - longPressStart.current.y
+    if (Math.hypot(dx, dy) > LONG_PRESS_CANCEL_PX) clearTimeout(longPressTimer.current)
+  }
+  const onCardPointerUp = () => clearTimeout(longPressTimer.current)
+  const onCardContextMenu = (id, e) => {
+    e.preventDefault()
+    clearTimeout(longPressTimer.current)
+    setArtMenu({ id, x: e.clientX, y: e.clientY })
+  }
+  const onCardClick = (id) => {
+    // a long-press just opened the menu for this card — don't also navigate
+    if (longPressFired.current) { longPressFired.current = false; return }
+    openArtwork(id)
+  }
+
+  // close the card menu on any outside pointerdown
+  useEffect(() => {
+    if (!artMenu) return
+    const onDown = (e) => { if (!e.target.closest?.('.artMenu')) setArtMenu(null) }
+    window.addEventListener('pointerdown', onDown)
+    return () => window.removeEventListener('pointerdown', onDown)
+  }, [artMenu])
+
   // one design = one plain object: this is what every save path (quick-save,
   // named slot, exported file) writes and what applyDesign reads back
   const designData = () => ({
-    version: 2, name: designName, technique: techniqueId, canvasCm, beadMM, palette, bg, bgT, bgShown, pack,
+    version: 3, name: designName, technique: techniqueId, canvasCm, beadMM, palette, bg, bgT, bgShown, pack,
+    groups: (groupsRef.current || []).map((g) => ({
+      id: g.id, name: g.name, visible: g.visible, locked: g.locked, collapsed: g.collapsed,
+    })),
     layers: layersRef.current.map((l) => ({
-      name: l.name, visible: l.visible, locked: l.locked, beads: [...l.beads.entries()],
+      name: l.name, visible: l.visible, locked: l.locked, groupId: l.groupId || null, beads: [...l.beads.entries()],
     })),
     activeIndex: Math.max(0, layersRef.current.findIndex((l) => l.id === activeIdRef.current)),
   })
@@ -1624,19 +1931,34 @@ export default function Home() {
       d.layers.forEach((l, i) => {
         nl[i].visible = l.visible !== false
         nl[i].locked = !!l.locked
+        if (l.groupId) nl[i].groupId = l.groupId
       })
       activeIndex = clampNum(d.activeIndex || 0, 0, nl.length - 1)
     } else if (Array.isArray(d.beads)) {
       nl = [makeLayer('Layer 1', new Map(d.beads))]
     }
     if (!nl) return false
+    // groups: keep only ones an actual layer still references (dangling ids
+    // dropped — e.g. a hand-edited or older/corrupt file); pre-v3 saves have
+    // no groups field at all and load with none, same as a fresh artwork.
+    const validGroupIds = new Set(nl.filter((l) => l.groupId).map((l) => l.groupId))
+    const ng = Array.isArray(d.groups)
+      ? d.groups
+          .filter((g) => g && validGroupIds.has(g.id))
+          .map((g) => ({
+            id: g.id, name: g.name || 'Group',
+            visible: g.visible !== false, locked: !!g.locked, collapsed: !!g.collapsed,
+          }))
+      : []
     if (undoable) pushHistory(currentDoc())
     const active = nl[activeIndex] || nl[0]
     layersRef.current = nl
+    groupsRef.current = ng
     activeIdRef.current = active.id
     beadsRef.current = active.beads
     patternBaseRef.current = null
     setLayers(nl)
+    setGroups(ng)
     setActiveId(active.id)
     setBeads(active.beads)
     setSelection(new Set())
@@ -1653,6 +1975,48 @@ export default function Home() {
       technique: t.label,
       beads: (rec.layers || []).reduce((n, l) => n + (l.beads ? l.beads.length : 0), 0),
       updatedAt: rec.updatedAt || 0,
+      thumb: rec.thumb || null,
+    }
+  }
+
+  // Small flat-colour preview PNG for the gallery card, generated from a
+  // design record (works on any rec: the live open artwork's autosave, an
+  // imported file, a duplicate — anything with layers/canvasCm/beadMM/
+  // technique). Iterates only PLACED beads (sparse, top-wins across visible
+  // layers), not the whole grid, so it stays cheap on a dense design.
+  const THUMB_W = 240
+  const THUMB_H = 168
+  const makeThumb = (rec) => {
+    try {
+      const t = getTechnique(rec.technique)
+      const { cols: tc, rows: tr } = t.beadCountFromCm({
+        canvasWcm: rec.canvasCm.w, canvasHcm: rec.canvasCm.h,
+        beadWmm: rec.beadMM.w, beadHmm: rec.beadMM.h,
+      })
+      if (!tc || !tr) return null
+      const merged = new Map()
+      for (const l of rec.layers || []) {
+        if (l.visible === false) continue
+        for (const [k, v] of l.beads || []) merged.set(k, v)
+      }
+      const canvas = document.createElement('canvas')
+      canvas.width = THUMB_W
+      canvas.height = THUMB_H
+      const ctx = canvas.getContext('2d')
+      const s = Math.min(THUMB_W / tc, THUMB_H / tr)
+      const ox = (THUMB_W - tc * s) / 2
+      const oy = (THUMB_H - tr * s) / 2
+      ctx.fillStyle = (rec.bg && rec.bg.type === 'solid' && rec.bg.color) || '#FFFFFF'
+      ctx.fillRect(ox, oy, tc * s, tr * s)
+      const cell = Math.max(1, Math.ceil(s))
+      for (const [k, v] of merged) {
+        const [c, r] = k.split(',').map(Number)
+        ctx.fillStyle = decodeBead(v).color
+        ctx.fillRect(ox + c * s, oy + r * s, cell, cell)
+      }
+      return canvas.toDataURL('image/png')
+    } catch {
+      return null
     }
   }
 
@@ -1663,12 +2027,14 @@ export default function Home() {
     setTechniqueId(techId)
     const l = makeLayer('Layer 1')
     layersRef.current = [l]
+    groupsRef.current = []
     activeIdRef.current = l.id
     beadsRef.current = l.beads
     patternBaseRef.current = null
     undoStack.current = []
     redoStack.current = []
     setLayers([l])
+    setGroups([])
     setActiveId(l.id)
     setBeads(l.beads)
     setSelection(new Set())
@@ -1781,7 +2147,11 @@ export default function Home() {
       const d = JSON.parse(await file.text())
       if (d && d.kind === 'beadwork-backup' && Array.isArray(d.artworks)) {
         for (const a of d.artworks) {
-          if (isDesign(a)) await putArtwork({ ...a, id: uid(), updatedAt: a.updatedAt || Date.now() })
+          if (isDesign(a)) {
+            const rec = { ...a, id: uid(), updatedAt: a.updatedAt || Date.now() }
+            rec.thumb = a.thumb || makeThumb(rec)
+            await putArtwork(rec)
+          }
         }
         const all = await listArtworks()
         setArtworks(all.map(summarize))
@@ -1795,6 +2165,7 @@ export default function Home() {
         file.name.replace(/(\.beadwork)?\.json$/i, '') ||
         nextTreeName(artworks.map((a) => a.name))
       const rec = { id, updatedAt: Date.now(), ...d, name }
+      rec.thumb = rec.thumb || makeThumb(rec)
       await putArtwork(rec)
       setArtworks((a) => [...a, summarize(rec)])
       openArtwork(id)
@@ -1810,12 +2181,18 @@ export default function Home() {
   useEffect(() => {
     if (screen !== 'editor' || !currentArtworkId) return
     clearTimeout(saveTimer.current)
+    // Scale the debounce with design size — serialising every layer's beads on
+    // every settle is cheap for a small design but adds up on a dense one.
+    let n = 0
+    for (const l of layers) n += l.beads.size
+    const delay = n > 40000 ? 4000 : n > 15000 ? 1800 : 600
     saveTimer.current = setTimeout(() => {
       const rec = { id: currentArtworkId, updatedAt: Date.now(), ...designData() }
+      rec.thumb = makeThumb(rec)
       putArtwork(rec)
         .then(() => setArtworks((a) => a.map((x) => (x.id === rec.id ? summarize(rec) : x))))
         .catch(() => {})
-    }, 600)
+    }, delay)
     return () => clearTimeout(saveTimer.current)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screen, currentArtworkId, layers, canvasCm, beadMM, palette, bg, bgT, bgShown, pack, designName, techniqueId])
@@ -1903,6 +2280,28 @@ export default function Home() {
               onChange={(e) => setBrush(+e.target.value)}
             />
             <span className="brushVal">{brush}</span>
+          </div>
+        )}
+
+        {tool !== 'select' && (
+          <div className="brushRow">
+            <span className="brushLabel">Stitch</span>
+            <div className="segmented stitchSeg">
+              {[
+                ['cross', '✕ Cross', 'Full cross stitch'],
+                ['line', '╱ Line', 'Single diagonal-line stitch'],
+                ['lineFlip', '╲ Flip', 'Single line stitch, flipped to the other diagonal'],
+              ].map(([id, label, hint]) => (
+                <button
+                  key={id}
+                  className={`seg ${stitchStyle === id ? 'on' : ''}`}
+                  onClick={() => setStitchStyle(id)}
+                  title={hint}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
         )}
 
@@ -2026,51 +2425,123 @@ export default function Home() {
                 <button className="lpAdd" onClick={addLayer} title="New layer">+</button>
               </div>
               <div className="layersList">
-                {/* top of the stack shows first (array is bottom→top) */}
-                {[...layers].reverse().map((l) => (
-                    <div
-                      key={l.id}
-                      className={`layerRow ${l.id === activeId ? 'on' : ''}`}
-                      onClick={() => switchLayer(l.id)}
-                    >
-                      <button
-                        className="lpEye"
-                        onClick={(e) => { e.stopPropagation(); toggleVisible(l.id) }}
-                        title={l.visible ? 'Hide layer' : 'Show layer'}
+                {/* top of the stack shows first (array is bottom→top); contiguous
+                    grouped runs render under one collapsible header. Inlined as
+                    an IIFE (not a separate outer function) so styled-jsx's
+                    scoping transform — which only walks JSX reachable from this
+                    return statement — actually applies to these elements. */}
+                {(() => {
+                  const row = (l, grouped) => {
+                    const thumb = layerThumb(l)
+                    return (
+                      <div
+                        key={l.id}
+                        className={`layerRow ${l.id === activeId ? 'on' : ''} ${grouped ? 'grouped' : ''}`}
+                        onClick={() => switchLayer(l.id)}
                       >
-                        {l.visible ? <IconEye /> : <IconEyeOff />}
-                      </button>
-                      <span
-                        className="lpName"
-                        onDoubleClick={() => {
-                          const name = window.prompt('Rename layer:', l.name)
-                          if (name !== null) renameLayer(l.id, name.trim() || l.name)
-                        }}
-                        title="Double-click to rename"
-                      >
-                        {l.name}
-                        {l.locked && <em className="lpLockTag">locked</em>}
-                      </span>
-                      <span className="lpCount">{l.beads.size}</span>
-                      <button
-                        className="lpLock"
-                        onClick={(e) => { e.stopPropagation(); toggleLock(l.id) }}
-                        title={l.locked ? 'Unlock layer' : 'Lock layer'}
-                      >
-                        {l.locked ? <IconLock /> : <IconUnlock />}
-                      </button>
-                    </div>
-                ))}
+                        <button
+                          className="lpEye"
+                          onClick={(e) => { e.stopPropagation(); toggleVisible(l.id) }}
+                          title={l.visible ? 'Hide layer' : 'Show layer'}
+                        >
+                          {l.visible ? <IconEye /> : <IconEyeOff />}
+                        </button>
+                        <div className="lpThumb">
+                          {thumb ? <img src={thumb} alt="" draggable={false} /> : <span className="lpThumbEmpty" />}
+                        </div>
+                        <span
+                          className="lpName"
+                          onDoubleClick={() => {
+                            const name = window.prompt('Rename layer:', l.name)
+                            if (name !== null) renameLayer(l.id, name.trim() || l.name)
+                          }}
+                          title="Double-click to rename"
+                        >
+                          {l.name}
+                          {l.locked && <em className="lpLockTag">locked</em>}
+                        </span>
+                        <span className="lpCount">{l.beads.size}</span>
+                        <button
+                          className="lpLock"
+                          onClick={(e) => { e.stopPropagation(); toggleLock(l.id) }}
+                          title={l.locked ? 'Unlock layer' : 'Lock layer'}
+                        >
+                          {l.locked ? <IconLock /> : <IconUnlock />}
+                        </button>
+                      </div>
+                    )
+                  }
+                  const topDown = [...layers].reverse()
+                  const out = []
+                  let i = 0
+                  while (i < topDown.length) {
+                    const l = topDown[i]
+                    if (l.groupId) {
+                      const gid = l.groupId
+                      const g = groups.find((x) => x.id === gid)
+                      const members = []
+                      while (i < topDown.length && topDown[i].groupId === gid) { members.push(topDown[i]); i++ }
+                      out.push(
+                        <div className="groupHeader" key={`g-${gid}`}>
+                          <button
+                            className="lpChevron"
+                            onClick={() => toggleGroupCollapsed(gid)}
+                            title={g?.collapsed ? 'Expand group' : 'Collapse group'}
+                          >
+                            {g?.collapsed ? '▸' : '▾'}
+                          </button>
+                          <button
+                            className="lpEye"
+                            onClick={() => toggleGroupVisible(gid)}
+                            title={g?.visible === false ? 'Show group' : 'Hide group'}
+                          >
+                            {g?.visible === false ? <IconEyeOff /> : <IconEye />}
+                          </button>
+                          <span
+                            className="lpName"
+                            onDoubleClick={() => {
+                              const name = window.prompt('Rename group:', g?.name || 'Group')
+                              if (name !== null) renameGroup(gid, name.trim() || (g?.name || 'Group'))
+                            }}
+                            title="Double-click to rename"
+                          >
+                            {g?.name || 'Group'}
+                            <em className="lpMemberCount"> · {members.length}</em>
+                          </span>
+                          <button className="lpFlatten" onClick={() => flattenGroup(gid)} title="Flatten group into one layer">Flat</button>
+                          <button
+                            className="lpLock"
+                            onClick={() => toggleGroupLocked(gid)}
+                            title={g?.locked ? 'Unlock group' : 'Lock group'}
+                          >
+                            {g?.locked ? <IconLock /> : <IconUnlock />}
+                          </button>
+                        </div>
+                      )
+                      if (!g?.collapsed) for (const m of members) out.push(row(m, true))
+                    } else {
+                      out.push(row(l, false))
+                      i++
+                    }
+                  }
+                  return out
+                })()}
               </div>
               <div className="layerActions">
                 {(() => {
                   const i = layers.findIndex((l) => l.id === activeId)
+                  const al = layers[i]
+                  const below = i > 0 ? layers[i - 1] : null
+                  const canGroup = !!al && !al.groupId && !!below
+                  const canUngroup = !!al?.groupId
                   return (
                     <>
                       <button onClick={() => duplicateLayer(activeId)} title="Duplicate active layer">Dup</button>
                       <button onClick={() => mergeDown(activeId)} disabled={i <= 0} title="Merge active layer down">Merge↓</button>
-                      <button onClick={() => moveLayer(activeId, 1)} disabled={i >= layers.length - 1} title="Move up">↑</button>
-                      <button onClick={() => moveLayer(activeId, -1)} disabled={i <= 0} title="Move down">↓</button>
+                      <button onClick={() => groupWithBelow(activeId)} disabled={!canGroup} title="Group with the layer below">Group</button>
+                      <button onClick={() => ungroupLayer(activeId)} disabled={!canUngroup} title="Remove from its group">Ungroup</button>
+                      <button onClick={() => moveLayer(activeId, 1)} disabled={i >= layers.length - 1 || !!al?.groupId} title="Move up">↑</button>
+                      <button onClick={() => moveLayer(activeId, -1)} disabled={i <= 0 || !!al?.groupId} title="Move down">↓</button>
                       <button onClick={() => deleteLayer(activeId)} disabled={layers.length <= 1} title="Delete active layer">Del</button>
                     </>
                   )
@@ -2259,24 +2730,51 @@ export default function Home() {
                   No artworks yet. Tap <b>+ New artwork</b> to plant your first one.
                 </div>
               ) : (
-                <div className="galleryList">
+                <div className="galleryGrid">
                   {[...artworks]
                     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
                     .map((a) => (
-                      <div className="artRow" key={a.id}>
-                        <button className="artOpen" onClick={() => openArtwork(a.id)} title="Open">
+                      <div
+                        className="artCard"
+                        key={a.id}
+                        title={`${a.name} — hold or right-click for options`}
+                        onPointerDown={(e) => onCardPointerDown(a.id, e)}
+                        onPointerMove={onCardPointerMove}
+                        onPointerUp={onCardPointerUp}
+                        onPointerLeave={onCardPointerUp}
+                        onContextMenu={(e) => onCardContextMenu(a.id, e)}
+                        onClick={() => onCardClick(a.id)}
+                      >
+                        <div className="artThumb">
+                          {a.thumb ? (
+                            <img src={a.thumb} alt="" draggable={false} />
+                          ) : (
+                            <span className="artMono">{(a.name || '?')[0].toUpperCase()}</span>
+                          )}
+                        </div>
+                        <div className="artCardFoot">
                           <span className="artName">{a.name}</span>
-                          <span className="artMeta">{a.technique} · {a.beads} beads · {timeAgo(a.updatedAt)}</span>
-                        </button>
-                        <div className="artActions">
-                          <button onClick={() => { const n = window.prompt('Rename artwork:', a.name); if (n !== null) renameArtwork(a.id, n) }}>Rename</button>
-                          <button onClick={() => duplicateArtwork(a.id)}>Duplicate</button>
-                          <button className="del" onClick={() => removeArtwork(a.id)}>Delete</button>
+                          <span className="artMeta">{a.beads} · {timeAgo(a.updatedAt)}</span>
                         </div>
                       </div>
                     ))}
                 </div>
               )}
+              {artMenu && (() => {
+                const a = artworks.find((x) => x.id === artMenu.id)
+                if (!a) return null
+                return (
+                  <div
+                    className="artMenu"
+                    style={{ left: Math.min(artMenu.x, window.innerWidth - 160), top: Math.min(artMenu.y, window.innerHeight - 140) }}
+                  >
+                    <button onClick={() => { setArtMenu(null); openArtwork(a.id) }}>Open</button>
+                    <button onClick={() => { setArtMenu(null); const n = window.prompt('Rename artwork:', a.name); if (n !== null) renameArtwork(a.id, n) }}>Rename</button>
+                    <button onClick={() => { setArtMenu(null); duplicateArtwork(a.id) }}>Duplicate</button>
+                    <button className="del" onClick={() => { setArtMenu(null); removeArtwork(a.id) }}>Delete</button>
+                  </div>
+                )
+              })()}
               <div className="galleryFoot">
                 <label className="ghost fileBtn half">
                   Import file / backup
@@ -2399,7 +2897,7 @@ export default function Home() {
         /* floating Procreate-style layers panel */
         .layersPanel {
           position: absolute; right: 84px; top: 50%; transform: translateY(-50%);
-          width: 210px; max-height: 78%;
+          width: 260px; max-height: 78%;
           display: flex; flex-direction: column;
           background: ${T.panelSolid};
           border-radius: 18px; padding: 10px;
@@ -2418,6 +2916,7 @@ export default function Home() {
         .layersList {
           display: flex; flex-direction: column; gap: 4px;
           overflow-y: auto; -webkit-overflow-scrolling: touch; min-height: 0;
+          overscroll-behavior: contain; /* a swipe inside the list must not rubber-band the page behind it */
         }
         .layerRow {
           display: flex; align-items: center; gap: 6px;
@@ -2426,11 +2925,18 @@ export default function Home() {
         }
         .layerRow:hover { background: #34343a; }
         .layerRow.on { border-color: ${T.accent}; background: #2f2f35; }
-        .lpEye, .lpLock {
+        .layerRow.grouped { margin-left: 14px; } /* indent under its group header */
+        .lpThumb {
+          flex-shrink: 0; width: 34px; height: 24px; border-radius: 4px; overflow: hidden;
+          background: #ffffff; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08);
+        }
+        .lpThumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
+        .lpThumbEmpty { display: block; width: 100%; height: 100%; }
+        .lpEye, .lpLock, .lpChevron, .lpFlatten {
           flex-shrink: 0; border: none; background: none; cursor: pointer;
           color: ${T.inkSoft}; display: flex; align-items: center; padding: 2px;
         }
-        .lpEye:hover, .lpLock:hover { color: ${T.ink}; }
+        .lpEye:hover, .lpLock:hover, .lpChevron:hover { color: ${T.ink}; }
         .lpName {
           flex: 1; min-width: 0; font-family: ${T.mono}; font-size: 11px;
           color: ${T.ink}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -2438,13 +2944,26 @@ export default function Home() {
         }
         .lpLockTag { font-size: 8px; font-style: normal; color: ${T.inkSoft};
           text-transform: uppercase; letter-spacing: 0.08em; }
-        .lpCount { flex-shrink: 0; font-family: ${T.mono}; font-size: 9px; color: ${T.inkSoft}; }
+        .lpCount { flex-shrink: 0; font-family: ${T.mono}; font-size: 9px; color: ${T.inkSoft}; margin-left: 4px; }
+        /* collapsible group header — same row language, sits above its members */
+        .groupHeader {
+          display: flex; align-items: center; gap: 6px;
+          background: #232327; border-radius: 7px; padding: 7px 8px;
+          border: 1px solid ${T.line};
+        }
+        .lpChevron { font-size: 11px; width: 14px; justify-content: center; }
+        .lpMemberCount { font-size: 9px; font-style: normal; color: ${T.inkSoft}; flex-shrink: 0; }
+        .lpFlatten {
+          font-family: ${T.mono}; font-size: 8.5px; text-transform: uppercase;
+          letter-spacing: 0.04em; padding: 3px 6px; border-radius: 5px; background: ${T.pill};
+        }
+        .lpFlatten:hover { background: #34343a; color: ${T.ink}; }
         .layerActions {
-          display: flex; gap: 4px; padding-top: 8px; margin-top: 6px;
+          display: flex; flex-wrap: wrap; gap: 4px; padding-top: 8px; margin-top: 6px;
           border-top: 1px solid ${T.line};
         }
         .layerActions button {
-          flex: 1; min-width: 0; border: none; background: ${T.pill}; color: ${T.ink};
+          flex: 1 1 28%; min-width: 0; border: none; background: ${T.pill}; color: ${T.ink};
           cursor: pointer; border-radius: 6px; padding: 7px 2px;
           font-family: ${T.mono}; font-size: 9px; letter-spacing: 0.02em;
         }
@@ -2477,7 +2996,7 @@ export default function Home() {
         /* both panels: cards scroll, the pinned cluster below stays visible */
         .panelScroll {
           flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
-          -webkit-overflow-scrolling: touch;
+          -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
           display: flex; flex-direction: column; gap: 11px;
         }
         .saveCluster {
@@ -2502,6 +3021,8 @@ export default function Home() {
         .brushLabel { font-family: ${T.mono}; font-size: 10px; text-transform: uppercase;
           letter-spacing: 0.1em; color: ${T.inkSoft}; }
         .brushVal { font-family: ${T.mono}; font-size: 12px; color: ${T.ink}; width: 12px; text-align: right; }
+        .stitchSeg { flex: 1; gap: 4px; }
+        .stitchSeg.segmented .seg { padding: 8px 2px; font-size: 10px; }
         /* min-width: 0 — a range input refuses to flex-shrink below its ~129px
            built-in size otherwise, which made the left panel scroll sideways */
         .slider { flex: 1; min-width: 0; -webkit-appearance: none; appearance: none; height: 3px;
@@ -2560,7 +3081,7 @@ export default function Home() {
           font-size: 16px; line-height: 1;
         }
         .savedList { display: flex; flex-direction: column; gap: 5px;
-          max-height: 168px; overflow-y: auto; }
+          max-height: 168px; overflow-y: auto; overscroll-behavior: contain; }
         .savedItem { display: flex; align-items: stretch; gap: 4px; }
         .savedApply {
           flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px;
@@ -2648,110 +3169,50 @@ export default function Home() {
           border-radius: ${T.radius}px; padding: 28px; text-align: center;
         }
         .galleryEmpty b { color: ${T.ink}; }
-        .galleryList { display: flex; flex-direction: column; gap: 8px; }
-        .artRow {
-          display: flex; align-items: stretch; gap: 8px;
+        /* Procreate-style thumbnail card grid: tap opens, hold/right-click
+           opens the artMenu instead of always-visible action buttons */
+        .galleryGrid {
+          display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+          gap: 14px;
+        }
+        .artCard {
+          display: flex; flex-direction: column; gap: 7px; cursor: pointer;
+          -webkit-user-select: none; user-select: none; touch-action: manipulation;
+        }
+        .artThumb {
+          aspect-ratio: 10 / 7; border-radius: 12px; overflow: hidden;
           background: ${T.panelSolid}; border: 1px solid ${T.line};
-          border-radius: ${T.radius}px; padding: 6px;
+          display: flex; align-items: center; justify-content: center;
+          transition: border-color 0.12s, transform 0.08s;
         }
-        .artOpen {
-          flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px;
-          background: none; border: none; cursor: pointer; text-align: left; padding: 8px 10px;
-          border-radius: 5px; transition: background 0.12s;
+        .artCard:active .artThumb { transform: scale(0.97); border-color: ${T.accent}; }
+        .artThumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
+        .artMono {
+          font-family: ${T.mono}; font-size: 26px; font-weight: 700; color: ${T.inkSoft};
         }
-        .artOpen:hover { background: ${T.pill}; }
-        .artName { font-size: 14px; font-weight: 700; color: ${T.ink};
+        .artCardFoot { display: flex; flex-direction: column; gap: 2px; padding: 0 2px; }
+        .artName { font-size: 13px; font-weight: 700; color: ${T.ink};
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .artMeta { font-family: ${T.mono}; font-size: 10px; color: ${T.inkSoft}; }
-        .artActions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
-        .artActions button {
-          border: none; background: ${T.pill}; color: ${T.ink}; cursor: pointer;
-          font-family: ${T.mono}; font-size: 9px; text-transform: uppercase;
-          letter-spacing: 0.04em; padding: 8px 9px; border-radius: 6px;
-        }
-        .artActions button:hover { background: #34343a; }
-        .artActions .del:hover { color: #fff; background: ${T.accent}; }
+        .artMeta { font-family: ${T.mono}; font-size: 9px; color: ${T.inkSoft};
+          text-transform: uppercase; letter-spacing: 0.04em; }
         .galleryFoot { display: flex; gap: 8px; }
         .galleryHint { text-align: center; }
+
+        /* long-press / right-click card menu */
+        .artMenu {
+          position: fixed; z-index: 70; display: flex; flex-direction: column;
+          min-width: 148px; background: ${T.panelSolid}; border: 1px solid ${T.line};
+          border-radius: 12px; padding: 5px; box-shadow: 0 12px 34px rgba(0,0,0,0.5);
+        }
+        .artMenu button {
+          border: none; background: none; color: ${T.ink}; cursor: pointer;
+          font-family: ${T.mono}; font-size: 11px; text-transform: uppercase;
+          letter-spacing: 0.04em; padding: 10px 11px; border-radius: 7px; text-align: left;
+        }
+        .artMenu button:hover { background: ${T.pill}; }
+        .artMenu button.del:hover { color: #fff; background: ${T.accent}; }
       `}</style>
     </div>
-  )
-}
-
-// minimal monochrome tool icons (inherit currentColor)
-function IconDraw() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 19l7-7 3 3-7 7-3-3z" />
-      <path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z" />
-      <path d="M2 2l7.586 7.586" />
-      <circle cx="11" cy="11" r="2" />
-    </svg>
-  )
-}
-function IconErase() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M20 20H7L3 16a2 2 0 010-3l9-9a2 2 0 013 0l5 5a2 2 0 010 3l-7 8" />
-      <path d="M9 11l5 5" />
-    </svg>
-  )
-}
-function IconSelect() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" strokeDasharray="3 3">
-      <rect x="3" y="3" width="18" height="18" rx="2" />
-    </svg>
-  )
-}
-function IconLayers() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 2l9 5-9 5-9-5 9-5z" />
-      <path d="M3 12l9 5 9-5" />
-      <path d="M3 17l9 5 9-5" />
-    </svg>
-  )
-}
-function IconEye() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z" />
-      <circle cx="12" cy="12" r="3" />
-    </svg>
-  )
-}
-function IconEyeOff() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M17.9 17.9A10.6 10.6 0 0112 19C5 19 1 12 1 12a18.5 18.5 0 014.2-5.1m3-1.6A10.6 10.6 0 0112 5c7 0 11 7 11 7a18.5 18.5 0 01-2.2 3.1" />
-      <path d="M9.9 9.9a3 3 0 004.2 4.2" />
-      <path d="M1 1l22 22" />
-    </svg>
-  )
-}
-function IconLock() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="3" y="11" width="18" height="11" rx="2" />
-      <path d="M7 11V7a5 5 0 0110 0v4" />
-    </svg>
-  )
-}
-function IconUnlock() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="3" y="11" width="18" height="11" rx="2" />
-      <path d="M7 11V7a5 5 0 019.9-1" />
-    </svg>
   )
 }
 

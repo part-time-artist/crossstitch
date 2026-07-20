@@ -430,3 +430,214 @@ IMPLEMENTED 2026-06-15:
 - App height **100dvh** (100vh hid the bottom buttons behind iPad Safari chrome).
 - `Pill` inputs edit a local draft while focused, so the field can be cleared
   to retype (canvas cm fields were impossible to edit); hex text fits (14px).
+
+> **NOTE (2026-07-20):** everything above this line is inherited verbatim from
+> the beadwork tool's `DESIGN_DECISIONS.md` at the point this repo was forked
+> — it describes the BEADWORK tool's UI (bead layers, "My designs" slots,
+> etc.), not what's currently shipped here (which has since moved to the
+> "My artworks" gallery, jat square grid, etc.). Treat it as historical
+> background on the shared architecture, not as this repo's current state.
+> The section below is the first entry that actually documents cross-stitch
+> tool changes.
+
+## Perf fixes + exact stitch shape (2026-07-20)
+User reported the tool lagging; also supplied the studio's traced SVG
+reference for the stitch mark (`assets/stitch svg/jat_basic _stitch.svg`) to
+replace the earlier hand-built approximation.
+
+1. **Stitch shape now traced from the reference SVG, not approximated.**
+   `src/techniques/jat.js` `drawStitch` previously built a parametric concave
+   4-point star via 4 `bezierCurveTo` calls RECOMPUTED every draw call. Now a
+   `Path2D` is built ONCE from the SVG's literal path data (viewBox 1080×1350,
+   same 4:5 ratio as the cell) and cached module-wide; each cell just
+   `translate`s/`scale`s into place and fills the cached path. Exact visual
+   match to the reference, and meaningfully cheaper per cell (no per-draw
+   curve math). Verified `scripts/jatcheck.mjs` (screenshot shows the traced
+   X, not the old symmetric astroid).
+2. **`paintBrush` cloned the WHOLE bead Map on every pointer event during a
+   freehand stroke** (up to ~240Hz) — `applyBeads(prev => new Map(prev)...)`
+   ran per event, not per stroke, so a dense design allocated a full-map copy
+   on every single pencil sample. Fixed the same way the beadwork tool fixed
+   it: a new `strokeWorking` ref clones `strokeBase` lazily on the first real
+   change and mutates that private copy in place for the rest of the stroke;
+   reset to `null` at stroke start/end and whenever the line-snap path
+   (`paintAlong`, which already rebuilds fresh from `strokeBase` each time)
+   takes over, so it can't hold a stale/abandoned Map. Verified
+   `scripts/undocheck.mjs` (freehand strokes still undo/redo as exactly one
+   step each).
+3. **No zoom/pan blit cache — every wheel/pinch/pan step re-ran the full
+   per-cell redraw** (all the more expensive with the bezier/Path2D stitch
+   draw). Added the same fix as the beadwork tool: `sceneCacheRef`/
+   `cacheViewRef` hold the last full render + the view it was drawn at;
+   `interactingRef` flips on for the duration of a gesture (`beginInteract()`,
+   called from the wheel handler and the pinch/pan branches of
+   `onPointerMove`), during which `requestRedraw` blits the cached raster
+   through the device-space transform DELTA between the cached view and the
+   live one (`devMat`/`drawBlit`) instead of walking every bead. Settles to a
+   crisp full render (refreshing the cache) ~130ms after the gesture stops.
+   The scene-repaint effect now goes through `requestRedraw` too, so both
+   paths share one chooser. Verified `scripts/perfcheck.mjs` (35-step zoom
+   burst over a filled canvas: 0 long tasks).
+4. **Autosave debounce now scales with design size** (600ms → 1800ms above
+   15k beads → 4000ms above 40k), matching the beadwork tool — serialising
+   every layer on every settle only got expensive on a dense design.
+5. **Found + fixed independently: Ctrl/⌘+Z silently did nothing after
+   clicking ANY button** (zoom control, "+ New artwork", tool strip, ...).
+   The guard required `e.target === document.body`; clicking a button moves
+   focus off body, so undo bailed. This is the exact bug the beadwork tool
+   fixed in its "Fixes + layers pass" — same fix here: only skip real text
+   fields (`INPUT`/`TEXTAREA`/contentEditable), and blur any focused text
+   input on canvas `pointerdown` so native input-undo can't fire instead.
+   Verified `scripts/undocheck.mjs`.
+
+Not done this pass (lower priority / separate from the live-drawing
+complaint, flagged for later if still needed): the bead-texture tile overlay
+for the mid-zoom LOD band (jat's grid has no stagger, so this would be a
+simple 1×1 tile if built), fast/batched PNG export (`lib/chart.js`
+`drawBeads` still does per-cell `beginPath→stroke→fill` with no flush — same
+bug the beadwork tool's "fast PNG export" fix addressed, but this only
+affects Save PNG, not drawing), reference-image downscaling.
+
+## iPad UI pass — porting the beadwork tool's newer chrome (2026-07-20)
+User asked to bring this tool's iPad UI in line with where the beadwork
+tool's UI has moved on to since the fork point. Researched the gap (the
+beadwork tool's `DESIGN_DECISIONS.md` is 1482 lines vs this file's ~430 —
+substantial drift) and ported four pieces, all in `src/App.jsx` unless noted:
+
+1. **Icon set → Framework7/iOS-style** (`src/icons.jsx`, new file, ported
+   verbatim from the beadwork tool). Replaced the 8 inline outline-SVG icon
+   components (`IconDraw`/`IconErase`/`IconSelect`/`IconLayers`/`IconEye`/
+   `IconEyeOff`/`IconLock`/`IconUnlock`) with imports from `./icons` — same
+   component names, so every call site is unchanged.
+2. **Modal/panel touch-scroll**: added `overscroll-behavior: contain` to the
+   three persistent scrollable regions (`.layersList`, `.panelScroll`,
+   `.savedList`) so an iPad swipe inside them can't rubber-band/chain-scroll
+   the page behind (already blocked at the body level, but the inner glow
+   wasn't contained). Scope note: this app has no custom scrolling modals
+   like the beadwork tool's Artwork Details drawer / PhotoImport (rename and
+   delete use native `window.prompt`/`confirm`), so there was nothing further
+   to redesign there.
+3. **Gallery: thumbnail cards + long-press menu**, replacing the text-row
+   list. `makeThumb(rec)` (near `summarize`) renders a small flat-colour PNG
+   from a design record — iterates only PLACED beads (top-wins across
+   visible layers), not the whole grid, so it stays cheap on a dense design —
+   stored as `rec.thumb` alongside each artwork and regenerated wherever
+   beads can change (autosave, file import, backup restore; duplicate just
+   copies the existing thumb since beads don't change). `.galleryGrid` /
+   `.artCard` show it (monogram letter if none yet, e.g. a brand new blank
+   artwork). Tap opens; a ~450ms hold or right-click opens a floating
+   `.artMenu` (Open/Rename/Duplicate/Delete) instead of always-visible
+   buttons — `onCardPointerDown/Move/Up`, `LONG_PRESS_MS`/`LONG_PRESS_CANCEL_PX`
+   near the `screen`/`artworks` state. Verified `scripts/gallerycards.mjs`.
+4. **Layer groups + per-layer thumbnails**. `groups` state (parallel to
+   `layers`, mirrored in a `groupsRef` exactly like `layersRef`) holds
+   `{id,name,visible,locked,collapsed}`; member layers carry a matching
+   `groupId` and MUST stay contiguous in z-order. `layers` itself stays a
+   flat array (every hot path untouched) — this app has no drag-reorder yet
+   (↑/↓ buttons only), so `moveLayer` simply refuses to move a grouped layer
+   rather than risk splitting a group; Group/Ungroup are the only way to
+   change a grouped layer's position. `groupWithBelow(id)` joins the active
+   layer to the one directly below (its group if it has one, else forms a
+   new one) — only offered on an ungrouped layer, so it's always a same-block
+   extension, never a reorder. `flattenGroup` merges a group's layers
+   top-wins into one, at the bottom member's slot, one undo step (same rule
+   as the existing `mergeDown`). Group content changes (group/ungroup/
+   flatten) are one undo step via the existing `currentDoc()`/`pushHistory`
+   plumbing (just added `groups` to the snapshot); visibility/lock/rename/
+   collapse are metadata, not undoable — same policy already used for
+   per-layer toggles. `layerVisible(l, groups)` is the one place effective
+   (layer AND group) visibility is computed; both `drawScene`'s composite and
+   export's `flattenVisible` route through it. Save format bumped to v3:
+   `designData()` adds `groups` + each layer's `groupId`; `applyDesign` drops
+   dangling group ids (a group an import/hand-edit left with no members) and
+   defaults to `groups: []` for any pre-v3 save (no migration step needed —
+   absence is exactly a fresh/ungrouped state).
+   Per-layer thumbnails (`layerThumb`, 34×24, same flat-colour-block approach
+   as the gallery thumb but scoped to one layer's own beads) render in each
+   layers-panel row.
+   **Bug hit + fixed during this**: styled-jsx's scoping transform only walks
+   JSX reachable from the component's `return` statement — it does NOT reach
+   into a separately-defined helper function (`renderLayerRow`/
+   `renderLayerRows` as top-level `const`s in the component body, called via
+   `{renderLayerRows()}`), so those elements silently got NONE of the
+   `.layerRow`/`.lpThumb`/etc. rules (no `jsx-<hash>` class), collapsing the
+   whole row to unstyled block/inline defaults. Fixed by inlining the row
+   renderer as a nested function inside an IIFE directly in the JSX
+   (`{(() => { const row = (l, grouped) => (...); ...; return out })()}`),
+   matching the pattern the existing `.layerActions` block already used.
+   Worth remembering for any future layers-panel work in this file.
+   Verified `scripts/layergroups.mjs` (group/ungroup member count, collapse
+   hides rows, hide-group drops the right pixels and restores exactly,
+   rename, flatten reduces to one layer with the exact same rendered pixels).
+
+## Two stitch shapes: Cross + Line brush (2026-07-20)
+User caught that `jat_basic _stitch.svg` was being rendered wrong: it's a
+reference SHEET with TWO SEPARATE example stitches drawn on it (confirmed by
+rendering each of its 3 `<path>`s in isolation) — a full cross/X and a single
+diagonal-line stitch — not one combined shape. The earlier "exact SVG" pass
+(same day, above) had merged all three into one Path2D, so every filled cell
+was drawing the cross AND the line on top of each other.
+
+LOCKED (grilled): the two shapes are separate BRUSH options, mixable
+bead-by-bead within one design (like colour) — draw some stitches as Cross,
+others as Line, each remembers its own shape. Toggle lives in the left panel
+next to Brush, as a `.segmented` control (same visual pattern as the export
+Transparent/On-screen toggle).
+
+IMPLEMENTED:
+- `src/techniques/jat.js`: split into `CROSS_PATH_D` (was the SVG's 2nd
+  `<path>`) and `LINE_PATH_D` (the 1st `<path>`); the 3rd path (a sub-pixel
+  Illustrator export sliver) is dropped entirely. Each motif is normalised to
+  its OWN bounding box via a one-time `getBBox()` measurement (temporarily
+  attaching an off-screen `<svg>`, cached forever after) rather than the
+  shared 1080×1350 artboard the two were drawn on together — this is what
+  makes both fill their cell edge-to-edge (tips touching neighbours, so a run
+  of stitches reads as continuous diagonals) regardless of where each motif
+  sat on the reference sheet. `fillBead(ctx,cx,cy,w,h,color,tilt,style)`
+  picks the matching cached `{path,bbox}` by `style`.
+- `src/lib/beadValue.js` (new): a bead Map's value is normally just a colour
+  hex string (Cross, the default — every pre-existing save/design stays
+  valid with ZERO migration). A Line stitch adds a trailing `"|L"` marker.
+  `encodeBead(color,style)` / `decodeBead(value)` are the only two functions
+  that touch this encoding.
+- `stitchStyle` state (`'cross'|'line'`, default `'cross'`) in `App.jsx`,
+  ephemeral like `color` (not saved separately — it's baked into whichever
+  beads get painted while it's active, same as colour).
+- Every WRITE path that paints new/changed beads with the current tool now
+  encodes `(color, stitchStyle)`: `paintBrush`, `floodFill` (including its
+  early-bail comparison and boundary detection — a same-colour cross and line
+  region are treated as different regions, matching that they're visually
+  different textures), `paintAlong` (line-snap draw). `recolorSelection` is
+  the one exception: it decodes the EXISTING style and re-encodes with just
+  the new colour, so Recolour never silently reshapes a stitch. Everywhere
+  that just COPIES existing bead values through unchanged — `mergeDown`,
+  `flattenGroup`, `flattenVisible` (export), the pattern maker, duplicate/move
+  (`placing.motif`) — needed no change at all, since copying the raw encoded
+  string already preserves whatever style it carried.
+- Every READ path that turns a bead value into an actual CSS colour now
+  decodes first: `drawScene`'s per-cell fill (both the `simple` LOD rect path
+  and `tech.fillBead`), the duplicate/move ghost preview, the gallery
+  thumbnail (`makeThumb`), the layers-panel thumbnail (`layerThumb`), and in
+  `chart.js`: `drawBeads` (export/print) and `tallyColors` (the legend —
+  grouped by colour only, so a cross and a line stitch of the same thread
+  colour are ONE legend entry, not two, per the existing "swatch + count per
+  colour" decision).
+- Verified `scripts/stitchstyle.mjs`: default is Cross; switching to Line and
+  drawing produces visibly distinct shapes in the same design; Recolour via
+  marquee-select changes colour but keeps each stitch's shape; undo/redo
+  correct; gallery round-trip (close artwork, reopen) preserves both shapes
+  exactly; PNG export renders both shapes and the legend shows one merged
+  colour entry (`×6` for 3 cross + 3 line of the same pink).
+
+## 3rd brush: Line Flip (2026-07-20, same session)
+User asked for a third option: the line stitch mirrored to the OTHER
+diagonal. `beadValue.js`'s marker table extended to `{line: '|L', lineFlip:
+'|F'}` (still zero migration for old plain-colour saves). No new path data
+needed: `jat.js`'s `drawStitch` draws `style: 'lineFlip'` using the SAME
+cached line motif, just with the cell transform's Y scale negated (and the Y
+translate adjusted to `-(bbox.y + bbox.height)` instead of `-bbox.y`) — a
+mirror within the motif's own bbox, so a "╱" becomes a "╲". Segmented control
+in the left panel now has three buttons: ✕ Cross / ╱ Line / ╲ Flip. Verified
+`scripts/stitchflip.mjs`: all three shapes render distinctly (and the flip
+visibly mirrors to the other diagonal), round-trips through gallery
+close/reopen exactly.
