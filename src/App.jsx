@@ -12,27 +12,97 @@ import {
 import {
   IconDraw, IconErase, IconSelect, IconLayers,
   IconEye, IconEyeOff, IconLock, IconUnlock,
+  IconHome, IconMenu, IconUndo, IconRedo,
 } from './icons'
 import { encodeBead, decodeBead } from './lib/beadValue'
 
-// ---- design tokens: charcoal "reown"-style chrome (see cross stitch references/
-// ui reference.png). Dark rounded panels, monospace UPPERCASE labels, one blue
-// accent for the primary action. Artboard stays light so thread colours stay
-// honest (the designer judges cross-stitch colours against near-white fabric).
-const T = {
-  bg: '#1b1b1d', // charcoal backdrop + sidebar
-  panel: '#1b1b1d', // sidebar
-  panelSolid: '#262629', // section blocks / cards
-  ink: '#f4f4f2', // primary text
-  inkSoft: '#8b8b87', // muted labels
-  line: '#36363c', // hairlines / dotted grid
-  active: '#f4f4f2', // active = light fill, dark text
-  activeInk: '#1b1b1d',
-  accent: '#3d6efb', // reference blue — primary action + active rings
-  pill: '#2c2c31', // input / control background
-  artboard: '#f3f3f0', // the canvas (light, for honest colour)
+// ---- design tokens: same canvas-first iPad chrome as the beadwork tool
+// (full-screen board, floating pills/rails, no side panels), with cross-
+// stitch's own BLUE accent instead of beadwork's green so the two tools stay
+// visually distinct at a glance. Two themes (dark default, light) share one
+// token vocabulary via a Proxy, so every `${T.x}` re-themes when the user
+// flips Light/Dark mode in the Menu. Artboard stays light in both themes so
+// thread colours are judged against near-white fabric.
+const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Avenir, Helvetica, sans-serif"
+const MONO = "'SFMono-Regular', ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace"
+const SHARED = {
+  accent: '#3d6efb', // primary action + active outline (both themes)
+  artboard: '#f3f3f0', // the canvas — always light, for honest thread colour
+  darkInk: '#1b1b1d', // ink that must stay dark (on the light artboard/bars)
   radius: 12,
-  mono: "'SFMono-Regular', ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace",
+  mono: MONO,
+  sans: FONT,
+}
+const DARK = {
+  ...SHARED,
+  bg: '#232325', panel: '#2c2c31', panelSolid: '#262629',
+  ink: '#f4f4f2', inkSoft: '#8b8b87', light: '#75757a', line: '#3a3a3f',
+  active: '#f4f4f2', activeInk: '#1b1b1d', pill: '#2c2c31', thumb: '#8b8b87', track: '#232325',
+  rowBg: '#2c2c31', rowActive: '#f4f4f2', rowInk: '#f4f4f2', rowActiveInk: '#1b1b1d',
+  hoverPill: '#34343a', overlay: 'rgba(255,255,255,0.1)',
+}
+const LIGHT = {
+  ...SHARED,
+  bg: '#e9e8e4', panel: '#f6f5f2', panelSolid: '#efeee9',
+  ink: '#232325', inkSoft: '#6d6c68', light: '#9a9994', line: '#d9d7d1',
+  active: '#232325', activeInk: '#f7f7f5', pill: '#e6e4de', thumb: '#8f8e88', track: '#d4d2cc',
+  rowBg: '#e2e0d9', rowActive: '#ffffff', rowInk: '#5a5852', rowActiveInk: '#232325',
+  hoverPill: '#d8d6cf', overlay: 'rgba(0,0,0,0.06)',
+}
+const THEMES = { dark: DARK, light: LIGHT }
+const themeState = { active: 'dark' } // flipped by the theme toggle (below)
+const T = new Proxy({}, { get: (_t, k) => THEMES[themeState.active][k] })
+
+// A soft, synthesised stitch "tick" — a short woody knock, no audio files, so
+// it doesn't add asset weight. Rate-capped so a fast drag reads as a pleasant
+// tok-tok-tok, not a buzz. Ported from the beadwork tool's bead-tick.
+let _actx = null
+let _noise = null
+let _lastTick = 0
+function playStitchTick(kind = 'place') {
+  const now = performance.now()
+  if (now - _lastTick < 26) return
+  _lastTick = now
+  try {
+    if (!_actx) _actx = new (window.AudioContext || window.webkitAudioContext)()
+    if (_actx.state === 'suspended') _actx.resume()
+    const ctx = _actx
+    const t = ctx.currentTime
+    if (!_noise) {
+      const len = Math.floor(ctx.sampleRate * 0.05)
+      _noise = ctx.createBuffer(1, len, ctx.sampleRate)
+      const d = _noise.getChannelData(0)
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1
+    }
+    const peak = kind === 'erase' ? 0.05 : 0.07
+    const src = ctx.createBufferSource()
+    src.buffer = _noise
+    const bp = ctx.createBiquadFilter()
+    bp.type = 'bandpass'
+    bp.frequency.value = (kind === 'erase' ? 620 : 980) + Math.random() * 260
+    bp.Q.value = 7
+    const ng = ctx.createGain()
+    ng.gain.setValueAtTime(0.0001, t)
+    ng.gain.exponentialRampToValueAtTime(peak, t + 0.004)
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.045)
+    src.connect(bp).connect(ng).connect(ctx.destination)
+    src.start(t)
+    src.stop(t + 0.05)
+    // body (a short lowpassed sine for warmth)
+    const osc = ctx.createOscillator()
+    osc.type = 'sine'
+    osc.frequency.value = (kind === 'erase' ? 180 : 260) + Math.random() * 40
+    const lp = ctx.createBiquadFilter()
+    lp.type = 'lowpass'
+    lp.frequency.value = 900
+    const og = ctx.createGain()
+    og.gain.setValueAtTime(0.0001, t)
+    og.gain.exponentialRampToValueAtTime(peak * 0.7, t + 0.006)
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.07)
+    osc.connect(lp).connect(og).connect(ctx.destination)
+    osc.start(t)
+    osc.stop(t + 0.08)
+  } catch (e) {}
 }
 
 const STORAGE_KEY = 'beadwork3_palettes_v1'
@@ -159,7 +229,7 @@ export default function Home() {
   // the TOP one wins (a woven bead is one solid colour — no blending).
   const uid = () => Math.random().toString(36).slice(2, 9)
   const makeLayer = (name, beadMap = new Map()) => ({
-    id: uid(), name, visible: true, locked: false, beads: beadMap,
+    id: uid(), name, visible: true, locked: false, alphaLock: false, beads: beadMap,
   })
   const firstLayerRef = useRef(null)
   if (!firstLayerRef.current) firstLayerRef.current = makeLayer('Layer 1')
@@ -176,6 +246,16 @@ export default function Home() {
   const [tool, setTool] = useState('draw') // draw | erase | select
   const [color, setColor] = useState('#F3CEDE') // starts on the palette's pink
   const [stitchStyle, setStitchStyle] = useState('cross') // 'cross' | 'line' — the brush's active stitch shape
+
+  // ---- canvas-first iPad chrome state (Menu dropdown, colour panel, layers
+  // panel, Artwork Details modal — all floating overlays, no side panels) ----
+  const [showMenu, setShowMenu] = useState(false)
+  const [showColor, setShowColor] = useState(false)
+  const [showDetails, setShowDetails] = useState(false)
+  const [editName, setEditName] = useState(false)
+  const [themeName, setThemeNameState] = useState('dark')
+  const setTheme = (name) => { themeState.active = name; setThemeNameState(name) }
+  const [soundOn, setSoundOn] = useState(true)
   const [pack, setPack] = useState(0.75) // 0 = spaced (true size) … 1 = max packed; 0.75 ≈ touching
   const [brush, setBrush] = useState(1) // brush radius in beads
   const [recentColors, setRecentColors] = useState([]) // up to 5 recently used
@@ -459,6 +539,14 @@ export default function Home() {
     layersRef.current = nl
     setLayers(nl)
   }
+  // Alpha lock: drawing on this layer only RECOLOURS beads already there —
+  // can't add to empty cells or change the design's shape. Simplest fit for
+  // one-solid-stitch-per-node (not a clipping mask).
+  const toggleAlphaLock = (id) => {
+    const nl = layersRef.current.map((l) => (l.id === id ? { ...l, alphaLock: !l.alphaLock } : l))
+    layersRef.current = nl
+    setLayers(nl)
+  }
 
   // ---- layer GROUPS (Procreate-style folders) -------------------------------
   // Model stays a flat `layers` array (every hot path above is untouched);
@@ -722,6 +810,8 @@ export default function Home() {
       const cells = brushCells(x, y)
       if (!cells.length) return
       const val = encodeBead(color, stitchStyle)
+      const alphaLocked = mode !== 'erase' && !!activeLayer?.alphaLock
+      let changed = false
       applyBeads((prev) => {
         // Freehand strokes call this on every pointer event (up to ~240Hz).
         // Clone the stroke's base Map ONCE (lazily, on the first real change)
@@ -736,16 +826,21 @@ export default function Home() {
             if ((next || prev).has(k)) {
               if (!next) { next = new Map(prev); strokeWorking.current = next }
               next.delete(k)
+              changed = true
             }
+          } else if (alphaLocked && !(next || prev).has(k)) {
+            continue // alpha lock: only recolour existing stitches, never add new ones
           } else if ((next || prev).get(k) !== val) {
             if (!next) { next = new Map(prev); strokeWorking.current = next }
             next.set(k, val)
+            changed = true
           }
         }
         return next || prev
       }, true) // silent: strokes repaint via rAF, no React render per event
+      if (changed && soundOn) playStitchTick(mode === 'erase' ? 'erase' : 'place')
     },
-    [brushCells, color, stitchStyle, applyBeads]
+    [brushCells, color, stitchStyle, applyBeads, soundOn, activeLayer]
   )
 
   // ---- selection (marquee Select tool) ----
@@ -1744,8 +1839,8 @@ export default function Home() {
   }
 
   // ---- export (print-ready chart: outlined beads + guides + numbers + legend) ----
-  const chartBackground = () => {
-    if (exportBg === 'transparent') return { type: 'transparent' }
+  const chartBackground = (mode = exportBg) => {
+    if (mode === 'transparent') return { type: 'transparent' }
     if (bg.type === 'image') {
       // a hidden image exports as the solid colour, same as on screen
       if (!bgShown || !bgImgRef.current) return { type: 'solid', color: bg.color }
@@ -1771,7 +1866,7 @@ export default function Home() {
     return m
   }
 
-  const exportPNG = () => {
+  const exportPNG = (mode = exportBg) => {
     const flat = flattenVisible()
     const chart = renderFullChart({
       beads: flat,
@@ -1781,7 +1876,7 @@ export default function Home() {
       tech,
       printBeadMm,
       beadRatio,
-      background: chartBackground(),
+      background: chartBackground(mode),
     })
     const legend = renderLegend(flat)
     const gap = 24
@@ -1796,7 +1891,7 @@ export default function Home() {
     out.height = Math.ceil(outH * s)
     const ctx = out.getContext('2d')
     ctx.scale(s, s)
-    if (exportBg !== 'transparent') {
+    if (mode !== 'transparent') {
       ctx.fillStyle = '#FFFFFF'
       ctx.fillRect(0, 0, outW, outH)
     }
@@ -2254,130 +2349,6 @@ export default function Home() {
 
   return (
     <div className="app">
-      {/* LEFT panel — tools & document. Scrolls; hold-to-clear pinned at the bottom. */}
-      <aside className="panel left">
-        <div className="panelScroll">
-        <div className="brand">CROSS STITCH<span className="dot" /></div>
-        <div className="sub">{tech.subtitle}</div>
-
-        {!canEdit && (
-          <div className="lockNote">
-            {activeLayer && !activeLayer.visible ? 'Active layer is hidden' : 'Active layer is locked'}
-            {' '}— drawing is off.
-          </div>
-        )}
-
-        {tool !== 'select' && (
-          <div className="brushRow">
-            <span className="brushLabel">Brush</span>
-            <input
-              className="slider"
-              type="range"
-              min="1"
-              max="6"
-              step="1"
-              value={brush}
-              onChange={(e) => setBrush(+e.target.value)}
-            />
-            <span className="brushVal">{brush}</span>
-          </div>
-        )}
-
-        {tool !== 'select' && (
-          <div className="brushRow">
-            <span className="brushLabel">Stitch</span>
-            <div className="segmented stitchSeg">
-              {[
-                ['cross', '✕ Cross', 'Full cross stitch'],
-                ['line', '╱ Line', 'Single diagonal-line stitch'],
-                ['lineFlip', '╲ Flip', 'Single line stitch, flipped to the other diagonal'],
-              ].map(([id, label, hint]) => (
-                <button
-                  key={id}
-                  className={`seg ${stitchStyle === id ? 'on' : ''}`}
-                  onClick={() => setStitchStyle(id)}
-                  title={hint}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {(tool === 'select' || selection.size > 0 || placing) && (
-          <div className="card selCard">
-            <div className="cardTitle">Selection · {selection.size}</div>
-            <div className="pillRow">
-              <button className="ghost" onClick={recolorSelection} disabled={!selection.size || !canEdit}>Recolour</button>
-              <button className="ghost" onClick={deleteSelection} disabled={!selection.size || !canEdit}>Delete</button>
-            </div>
-            {!placing && (
-              <div className="pillRow">
-                <button className="ghost half" onClick={() => startPlacing('copy')} disabled={!selection.size || !canEdit}>Duplicate</button>
-                <button className="ghost half" onClick={() => startPlacing('move')} disabled={!selection.size || !canEdit}>Move</button>
-              </div>
-            )}
-            {placing && (
-              <>
-                <div className="cardTitle small">{placing.mode === 'move' ? 'Moving selection' : 'Placing copy'}</div>
-                <div className="pillRow">
-                  <button className="ghost half" onClick={placeMotif} disabled={!canEdit}>Place</button>
-                  <button className="ghost half" onClick={() => setPlacing(null)}>Cancel</button>
-                </div>
-                <div className="hint tip">
-                  {placing.mode === 'move'
-                    ? 'Drag the faded beads to their new spot, then tap Place. Cancel puts them back.'
-                    : 'Drag the faded copy on the canvas, then tap Place. The placed copy stays selected — Duplicate again to keep stamping.'}
-                </div>
-              </>
-            )}
-            {selection.size > 0 && <button className="ghost" onClick={clearSelection}>Clear selection</button>}
-            <div className="cardTitle small">Pattern maker</div>
-            <div className="pillRow">
-              <button className="ghost" onClick={() => makePattern('grid')} disabled={!selection.size || !canEdit}>Grid</button>
-              <button className="ghost" onClick={() => makePattern('brick')} disabled={!selection.size || !canEdit}>Brick</button>
-              <button className="ghost" onClick={() => makePattern('halfdrop')} disabled={!selection.size || !canEdit}>½ drop</button>
-            </div>
-            <Pill
-              value={patternGap}
-              label="gap beads"
-              onChange={(v) => setPatternGap(clampNum(Math.round(v), 0, 60))}
-            />
-            <div className="hint tip">
-              Drag a box over coloured beads to select a motif, then repeat it
-              across the whole canvas. Gap = empty beads between repeats.
-              Undo removes the pattern.
-            </div>
-          </div>
-        )}
-
-        <div className="hint tip">Drag a palette colour onto the canvas to fill a region.</div>
-
-        <div className="card">
-          <div className="cardTitle">Canvas size</div>
-          <div className="pillRow">
-            <Pill value={canvasCm.w} label="cm W" onChange={(v) => setCanvasCm((c) => ({ ...c, w: clampNum(v, 1, 300) }))} />
-            <Pill value={canvasCm.h} label="cm H" onChange={(v) => setCanvasCm((c) => ({ ...c, h: clampNum(v, 1, 300) }))} />
-          </div>
-          <div className="hint">≈ {cols} × {rows} stitches · pinch / scroll to zoom · finger / space-drag to pan · 2-finger tap undo · 3-finger tap redo</div>
-        </div>
-
-        <div className="card">
-          <div className="cardTitle">Fabric colour</div>
-          <div className="colorTop">
-            <input type="color" value={bg.color} onChange={(e) => setBg((b) => ({ ...b, type: 'solid', color: e.target.value }))} className="bigSwatch" />
-            <Pill value={bg.color} label="hex" text onChange={(v) => setBg((b) => ({ ...b, type: 'solid', color: v }))} />
-          </div>
-          <div className="hint">The fabric the stitches sit on. Default white.</div>
-        </div>
-        </div>
-
-        <div className="saveCluster">
-          <HoldButton onHold={clearCanvas}>Hold to clear canvas</HoldButton>
-        </div>
-      </aside>
-
       <main className="stage">
         <div className="pasteboard" ref={wrapRef}>
           <canvas
@@ -2388,9 +2359,21 @@ export default function Home() {
             onPointerUp={onPointerUp}
             onPointerCancel={onPointerCancel}
           />
-          {/* floating tool strip — right edge, under a right-handed iPad user's
-              hand (locked iPad-pass decision #4). Big ≥44px touch targets. */}
-          <div className="toolStrip">
+
+          {/* ── two floating toolbar pills — Home/Menu left, tools+Colour right ── */}
+          <div className="tbPill tbLeft">
+            <button className="tbIcon" onClick={() => setScreen('gallery')} title="My artworks">
+              <IconHome />
+            </button>
+            <button
+              className={`tbIcon ${showMenu ? 'on' : ''}`}
+              onClick={() => { setShowMenu((v) => !v); setShowLayers(false); setShowColor(false) }}
+              title="Menu"
+            >
+              <IconMenu />
+            </button>
+          </div>
+          <div className="tbPill tbRight">
             {[
               ['draw', 'Draw', <IconDraw key="d" />],
               ['erase', 'Erase', <IconErase key="e" />],
@@ -2398,33 +2381,151 @@ export default function Home() {
             ].map(([id, label, icon]) => (
               <button
                 key={id}
-                className={`stripBtn ${tool === id ? 'on' : ''}`}
-                onClick={() => setTool(id)}
+                className={`tbIcon ${tool === id ? 'on' : ''}`}
+                onClick={() => { setTool(id); setShowLayers(false); setShowColor(false); setShowMenu(false) }}
                 title={label}
               >
                 {icon}
-                <span>{label}</span>
               </button>
             ))}
-            <span className="stripSep" />
             <button
-              className={`stripBtn ${showLayers ? 'on' : ''}`}
-              onClick={() => setShowLayers((v) => !v)}
+              className={`tbIcon ${showLayers ? 'on' : ''}`}
+              onClick={() => { setShowLayers((v) => !v); setShowColor(false); setShowMenu(false) }}
               title="Layers"
             >
               <IconLayers />
-              <span>Layers</span>
             </button>
+            <button
+              type="button"
+              className={`tbColor ${showColor ? 'on' : ''}`}
+              style={{ background: color }}
+              onClick={() => { setShowColor((v) => !v); setShowLayers(false); setShowMenu(false) }}
+              title="Colour"
+            />
           </div>
 
-          {/* floating Procreate-style layers panel (sits left of the tool strip) */}
+          {/* artwork name above the canvas — double-tap to rename */}
+          {editName ? (
+            <input
+              className="canvasName editing"
+              value={designName}
+              placeholder="Untitled"
+              autoFocus
+              onChange={(e) => setDesignName(e.target.value)}
+              onBlur={() => setEditName(false)}
+              onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+            />
+          ) : (
+            <span className="canvasName" onDoubleClick={() => setEditName(true)} title="Double-tap to rename">
+              {designName || 'Untitled'}
+            </span>
+          )}
+
+          {/* left rail: brush size + stitch shape. Hidden for the select tool. */}
+          {tool !== 'select' && (
+            <div className="brushRail">
+              <input
+                className="vSlider"
+                type="range" min="1" max="6" step="1"
+                value={brush}
+                onChange={(e) => setBrush(+e.target.value)}
+                title={`Brush size — ${brush}`}
+              />
+              <span className="brushRailVal">{brush}</span>
+              <div className="stitchRail">
+                {[
+                  ['cross', '✕', 'Cross stitch'],
+                  ['line', '╱', 'Line stitch'],
+                  ['lineFlip', '╲', 'Line stitch, other diagonal'],
+                ].map(([id, glyph, label]) => (
+                  <button
+                    key={id}
+                    className={`stitchRailBtn ${stitchStyle === id ? 'on' : ''}`}
+                    onClick={() => setStitchStyle(id)}
+                    title={label}
+                  >
+                    {glyph}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* right colour rail = the active palette. Drag a swatch onto the canvas to fill. */}
+          <div className="paletteRail">
+            {palette.map((c, i) => (
+              <button
+                key={i}
+                className={`railSw ${c === color ? 'on' : ''}`}
+                style={{ background: c }}
+                onPointerDown={onSwatchDown(c)}
+                onPointerMove={onSwatchMove}
+                onPointerUp={onSwatchUp}
+                onPointerCancel={onSwatchCancel}
+                title={c}
+              />
+            ))}
+          </div>
+
+          {/* undo / redo — bottom-left */}
+          <div className="undoRedo">
+            <button onClick={undo} title="Undo — 2-finger tap or Ctrl+Z"><IconUndo /></button>
+            <button onClick={redo} title="Redo — 3-finger tap or Ctrl+Shift+Z"><IconRedo /></button>
+          </div>
+
+          {/* drawing-off banner when the active layer is locked or hidden */}
+          {!canEdit && (
+            <div className="lockNote">
+              {activeLayer && !activeLayer.visible ? 'Active layer is hidden' : 'Active layer is locked'} — drawing is off.
+            </div>
+          )}
+
+          {/* image-adjust mode banner */}
+          {bgAdjust && (
+            <div className="adjustBar">
+              <span>ADJUST IMAGE — DRAG TO MOVE · PINCH / SCROLL TO RESIZE</span>
+              <button onClick={() => setBgAdjust(false)}>DONE</button>
+            </div>
+          )}
+
+          {/* selection tools — compact bottom-centre bar */}
+          {(tool === 'select' || selection.size > 0) && !placing && (
+            <div className="selPanel">
+              <div className="selRow">
+                <button className="selChip" onClick={() => startPlacing('move')} disabled={!selection.size || !canEdit}>Move</button>
+                <button className="selChip" onClick={() => startPlacing('copy')} disabled={!selection.size || !canEdit}>Duplicate</button>
+                <button className="selChip" onClick={recolorSelection} disabled={!selection.size || !canEdit}>Recolour</button>
+                <button className="selChip" onClick={deleteSelection} disabled={!selection.size || !canEdit}>Clear</button>
+              </div>
+              <div className="selRow">
+                <span className="selPatternLbl">Pattern</span>
+                <button className="selChip" onClick={() => makePattern('grid')} disabled={!selection.size || !canEdit}>Grid</button>
+                <button className="selChip" onClick={() => makePattern('brick')} disabled={!selection.size || !canEdit}>Brick</button>
+                <button className="selChip" onClick={() => makePattern('halfdrop')} disabled={!selection.size || !canEdit}>Half drop</button>
+                <Pill value={patternGap} label="gap" onChange={(v) => setPatternGap(clampNum(Math.round(v), 0, 60))} />
+              </div>
+            </div>
+          )}
+
+          {/* placement confirm — Place / Cancel the dragged ghost */}
+          {placing && (
+            <div className="selPanel">
+              <div className="selRow">
+                <span className="selPatternLbl">{placing.mode === 'move' ? 'Moving' : 'Placing'}</span>
+                <button className="selChip" onClick={placeMotif} disabled={!canEdit}>Place</button>
+                <button className="selChip" onClick={() => setPlacing(null)}>Cancel</button>
+              </div>
+            </div>
+          )}
+
+          {/* layers panel */}
           {showLayers && (
             <div className="layersPanel">
-              <div className="layersHead">
-                <span>LAYERS</span>
-                <button className="lpAdd" onClick={addLayer} title="New layer">+</button>
+              <div className="lpHead">
+                <span className="lpTitle">Layers</span>
+                <button className="lpAddBtn" onClick={addLayer} title="New layer">+</button>
               </div>
-              <div className="layersList">
+              <div className="lpList">
                 {/* top of the stack shows first (array is bottom→top); contiguous
                     grouped runs render under one collapsible header. Inlined as
                     an IIFE (not a separate outer function) so styled-jsx's
@@ -2436,37 +2537,40 @@ export default function Home() {
                     return (
                       <div
                         key={l.id}
-                        className={`layerRow ${l.id === activeId ? 'on' : ''} ${grouped ? 'grouped' : ''}`}
+                        className={`lpRow ${l.id === activeId ? 'active' : ''} ${grouped ? 'inGroup' : ''}`}
                         onClick={() => switchLayer(l.id)}
                       >
-                        <button
-                          className="lpEye"
-                          onClick={(e) => { e.stopPropagation(); toggleVisible(l.id) }}
-                          title={l.visible ? 'Hide layer' : 'Show layer'}
-                        >
-                          {l.visible ? <IconEye /> : <IconEyeOff />}
-                        </button>
-                        <div className="lpThumb">
-                          {thumb ? <img src={thumb} alt="" draggable={false} /> : <span className="lpThumbEmpty" />}
-                        </div>
+                        <span className="lpThumb">
+                          {thumb ? <img src={thumb} alt="" draggable={false} /> : null}
+                        </span>
                         <span
                           className="lpName"
                           onDoubleClick={() => {
                             const name = window.prompt('Rename layer:', l.name)
                             if (name !== null) renameLayer(l.id, name.trim() || l.name)
                           }}
-                          title="Double-click to rename"
+                          title="Double-tap to rename"
                         >
-                          {l.name}
-                          {l.locked && <em className="lpLockTag">locked</em>}
+                          {l.name} <span className="lpGroupCount">({l.beads.size})</span>
                         </span>
-                        <span className="lpCount">{l.beads.size}</span>
                         <button
-                          className="lpLock"
+                          className={`lpRowIcon ${l.alphaLock ? 'on' : ''}`}
+                          onClick={(e) => { e.stopPropagation(); toggleAlphaLock(l.id) }}
+                          title={l.alphaLock ? 'Alpha lock on — recolour only' : 'Alpha lock off'}
+                        >α</button>
+                        <button
+                          className="lpRowIcon"
                           onClick={(e) => { e.stopPropagation(); toggleLock(l.id) }}
-                          title={l.locked ? 'Unlock layer' : 'Lock layer'}
+                          title={l.locked ? 'Unlock' : 'Lock'}
                         >
                           {l.locked ? <IconLock /> : <IconUnlock />}
+                        </button>
+                        <button
+                          className="lpRowIcon"
+                          onClick={(e) => { e.stopPropagation(); toggleVisible(l.id) }}
+                          title={l.visible ? 'Hide' : 'Show'}
+                        >
+                          {l.visible ? <IconEye /> : <IconEyeOff />}
                         </button>
                       </div>
                     )
@@ -2482,39 +2586,37 @@ export default function Home() {
                       const members = []
                       while (i < topDown.length && topDown[i].groupId === gid) { members.push(topDown[i]); i++ }
                       out.push(
-                        <div className="groupHeader" key={`g-${gid}`}>
-                          <button
-                            className="lpChevron"
-                            onClick={() => toggleGroupCollapsed(gid)}
-                            title={g?.collapsed ? 'Expand group' : 'Collapse group'}
-                          >
-                            {g?.collapsed ? '▸' : '▾'}
-                          </button>
-                          <button
-                            className="lpEye"
-                            onClick={() => toggleGroupVisible(gid)}
-                            title={g?.visible === false ? 'Show group' : 'Hide group'}
-                          >
-                            {g?.visible === false ? <IconEyeOff /> : <IconEye />}
-                          </button>
+                        <div className="lpRow lpGroupRow" key={`g-${gid}`} onClick={() => toggleGroupCollapsed(gid)}>
+                          <span className={`lpChevron ${g?.collapsed ? '' : 'open'}`}>▸</span>
                           <span
                             className="lpName"
-                            onDoubleClick={() => {
+                            onDoubleClick={(e) => {
+                              e.stopPropagation()
                               const name = window.prompt('Rename group:', g?.name || 'Group')
                               if (name !== null) renameGroup(gid, name.trim() || (g?.name || 'Group'))
                             }}
-                            title="Double-click to rename"
+                            title="Tap to open/close · double-tap to rename"
                           >
-                            {g?.name || 'Group'}
-                            <em className="lpMemberCount"> · {members.length}</em>
+                            {g?.name || 'Group'} <span className="lpGroupCount">({members.length})</span>
                           </span>
-                          <button className="lpFlatten" onClick={() => flattenGroup(gid)} title="Flatten group into one layer">Flat</button>
                           <button
-                            className="lpLock"
-                            onClick={() => toggleGroupLocked(gid)}
+                            className="lpEditBtn"
+                            onClick={(e) => { e.stopPropagation(); flattenGroup(gid) }}
+                            title="Flatten the group into one layer"
+                          >Flatten</button>
+                          <button
+                            className="lpRowIcon"
+                            onClick={(e) => { e.stopPropagation(); toggleGroupLocked(gid) }}
                             title={g?.locked ? 'Unlock group' : 'Lock group'}
                           >
                             {g?.locked ? <IconLock /> : <IconUnlock />}
+                          </button>
+                          <button
+                            className="lpRowIcon"
+                            onClick={(e) => { e.stopPropagation(); toggleGroupVisible(gid) }}
+                            title={g?.visible === false ? 'Show group' : 'Hide group'}
+                          >
+                            {g?.visible === false ? <IconEyeOff /> : <IconEye />}
                           </button>
                         </div>
                       )
@@ -2527,183 +2629,198 @@ export default function Home() {
                   return out
                 })()}
               </div>
-              <div className="layerActions">
+              <div className="lpBar">
                 {(() => {
                   const i = layers.findIndex((l) => l.id === activeId)
                   const al = layers[i]
                   const below = i > 0 ? layers[i - 1] : null
                   const canGroup = !!al && !al.groupId && !!below
-                  const canUngroup = !!al?.groupId
                   return (
                     <>
-                      <button onClick={() => duplicateLayer(activeId)} title="Duplicate active layer">Dup</button>
-                      <button onClick={() => mergeDown(activeId)} disabled={i <= 0} title="Merge active layer down">Merge↓</button>
-                      <button onClick={() => groupWithBelow(activeId)} disabled={!canGroup} title="Group with the layer below">Group</button>
-                      <button onClick={() => ungroupLayer(activeId)} disabled={!canUngroup} title="Remove from its group">Ungroup</button>
-                      <button onClick={() => moveLayer(activeId, 1)} disabled={i >= layers.length - 1 || !!al?.groupId} title="Move up">↑</button>
-                      <button onClick={() => moveLayer(activeId, -1)} disabled={i <= 0 || !!al?.groupId} title="Move down">↓</button>
-                      <button onClick={() => deleteLayer(activeId)} disabled={layers.length <= 1} title="Delete active layer">Del</button>
+                      <button onClick={() => duplicateLayer(activeId)}>Duplicate</button>
+                      <span className="lpBarDiv" />
+                      <button
+                        onClick={() => (al?.groupId ? ungroupLayer(activeId) : groupWithBelow(activeId))}
+                        disabled={!al?.groupId && !canGroup}
+                        title={al?.groupId ? 'Dissolve this layer’s group' : 'Group with the layer below'}
+                      >
+                        {al?.groupId ? 'Ungroup' : 'Group'}
+                      </button>
+                      <span className="lpBarDiv" />
+                      <button className={al?.alphaLock ? 'on' : ''} onClick={() => toggleAlphaLock(activeId)}>Alpha lock</button>
+                      <span className="lpBarDiv" />
+                      <button onClick={() => mergeDown(activeId)} disabled={i <= 0}>Merge↓</button>
+                      <span className="lpBarDiv" />
+                      <button onClick={() => deleteLayer(activeId)} disabled={layers.length <= 1}>Delete</button>
                     </>
                   )
                 })()}
               </div>
-              <div className="lpHint">Top layer wins where beads overlap. Export flattens visible layers.</div>
             </div>
           )}
-          {/* image-adjust mode banner */}
-          {bgAdjust && (
-            <div className="adjustBar">
-              <span>ADJUST IMAGE — DRAG TO MOVE · PINCH / SCROLL TO RESIZE</span>
-              <button onClick={() => setBgAdjust(false)}>DONE</button>
-            </div>
-          )}
+
+          {/* zoom — bottom-right */}
           <div className="zoomCtl">
-            <button onClick={undo} title="Undo — 2-finger tap or Ctrl+Z">↶</button>
-            <button onClick={redo} title="Redo — 3-finger tap or Ctrl+Shift+Z">↷</button>
-            <span className="zsep" />
             <button onClick={() => zoomAt(1 / 1.2, viewport.w / 2, viewport.h / 2)} title="Zoom out">−</button>
             <button className="zval" onClick={fitView} title="Fit to screen">{Math.round(view.scale * 100)}%</button>
             <button onClick={() => zoomAt(1.2, viewport.w / 2, viewport.h / 2)} title="Zoom in">+</button>
           </div>
-        </div>
-        <div className="stageInfo">
-          {cols} × {rows} STITCHES · {canvasCm.w}×{canvasCm.h} CM · CELL {beadMM.w}×{beadMM.h} MM · {Math.round(view.scale * 100)}%
-          {view.rot ? ` · ${(((Math.round(view.rot * 180 / Math.PI) % 360) + 360) % 360)}°` : ''}
+
+          {/* ☰ dropdown */}
+          {showMenu && (
+            <>
+              <div className="menuScrim" onClick={() => setShowMenu(false)} />
+              <div className="menuPop">
+                <button className="menuItem" onClick={() => { setShowMenu(false); exportPNG('transparent') }}>Export PNG — transparent</button>
+                <div className="menuDiv" />
+                <button className="menuItem" onClick={() => { setShowMenu(false); exportPNG('screen') }}>Export PNG — on-screen</button>
+                <div className="menuDiv" />
+                <button className="menuItem" onClick={() => { setShowMenu(false); exportDesignFile() }}>Export artwork file</button>
+                <div className="menuDiv" />
+                <button className="menuItem" onClick={() => { setShowMenu(false); setShowDetails(true) }}>Artwork Details</button>
+                <div className="menuDiv" />
+                <button className="menuItem" onClick={() => setTheme(themeName === 'dark' ? 'light' : 'dark')}>
+                  {themeName === 'dark' ? 'Light mode' : 'Dark mode'}
+                </button>
+                <button className="menuItem" onClick={() => setSoundOn((v) => !v)}>
+                  {soundOn ? 'Stitch sound: on' : 'Stitch sound: off'}
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* Artwork Details modal */}
+          {showDetails && (
+            <div className="modalScrim" onClick={() => setShowDetails(false)}>
+              <div className="detailsModal" onClick={(e) => e.stopPropagation()}>
+                <div className="detailsHead">
+                  <span className="detailsTitle">Artwork Details</span>
+                  <button className="drawerClose" onClick={() => setShowDetails(false)} title="Close">×</button>
+                </div>
+                <div className="detailsScroll">
+                  <div className="card">
+                    <div className="cardTitle">Name</div>
+                    <Pill value={designName} label="name" text onChange={setDesignName} />
+                  </div>
+                  <div className="card">
+                    <div className="cardTitle">Canvas size</div>
+                    <div className="pillRow">
+                      <Pill value={canvasCm.w} label="cm W" onChange={(v) => setCanvasCm((c) => ({ ...c, w: clampNum(v, 1, 300) }))} />
+                      <Pill value={canvasCm.h} label="cm H" onChange={(v) => setCanvasCm((c) => ({ ...c, h: clampNum(v, 1, 300) }))} />
+                    </div>
+                    <div className="cardTitle small">{cols} × {rows} stitches</div>
+                  </div>
+                  <div className="card">
+                    <div className="cardTitle">Cell size</div>
+                    <div className="segmented">
+                      {BEAD_SIZES.map((s) => (
+                        <button
+                          key={s.label}
+                          className={`seg ${beadMM.w === s.w ? 'on' : ''}`}
+                          onClick={() => setBeadMM({ w: s.w, h: s.h })}
+                        >
+                          {s.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="cardTitle">Fabric colour</div>
+                    <div className="colorTop">
+                      <input type="color" value={bg.color} onChange={(e) => setBg((b) => ({ ...b, type: 'solid', color: e.target.value }))} className="bigSwatch" />
+                      <Pill value={bg.color} label="hex" text onChange={(v) => setBg((b) => ({ ...b, type: 'solid', color: v }))} />
+                    </div>
+                    <div className="hint">The fabric the stitches sit on. Default white.</div>
+                  </div>
+                  <div className="card">
+                    <HoldButton onHold={clearCanvas}>Hold to clear canvas</HoldButton>
+                    <button className="ghost" onClick={() => { setShowDetails(false); setScreen('gallery') }}>← My artworks</button>
+                  </div>
+                  <div className="drawerInfo">
+                    {cols} × {rows} grid · {canvasCm.w}×{canvasCm.h} cm · cell {beadMM.w}×{beadMM.h} mm
+                    {' · '}{layers.reduce((n, l) => n + (l.beads ? l.beads.size : 0), 0).toLocaleString()} placed
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* colour picker panel — opens from the toolbar colour dot */}
+          {showColor && (
+            <>
+              <div className="menuScrim" onClick={() => setShowColor(false)} />
+              <div className="colorPanel">
+                <div className="cpHead">
+                  <span className="cpTitle">Colours</span>
+                  <button className="drawerClose" onClick={() => setShowColor(false)} title="Close">×</button>
+                </div>
+                <div className="colorTop">
+                  <input type="color" value={color} onChange={(e) => setColor(e.target.value)} className="bigSwatch" />
+                  <Pill value={color} label="hex" text onChange={(v) => setColor(v)} />
+                </div>
+                {recentColors.length > 0 && (
+                  <>
+                    <div className="cpLabel">History</div>
+                    <div className="cpBox">
+                      {recentColors.map((c, i) => (
+                        <button key={i} className={`cpSw ${c === color ? 'on' : ''}`} style={{ background: c }} onClick={() => setColor(c)} title={c} />
+                      ))}
+                    </div>
+                  </>
+                )}
+                <div className="cpPalHead">
+                  <span className="cpLabel">Palette</span>
+                </div>
+                <div className="cpBox">
+                  {palette.map((c, i) => (
+                    <button
+                      key={i}
+                      className={`cpSw ${c === color ? 'on' : ''}`}
+                      style={{ background: c }}
+                      onPointerDown={onSwatchDown(c)}
+                      onPointerMove={onSwatchMove}
+                      onPointerUp={onSwatchUp}
+                      onPointerCancel={onSwatchCancel}
+                      title={`${c} — tap to pick, drag onto canvas to fill`}
+                    />
+                  ))}
+                  <button
+                    className="cpSw add"
+                    title="Add current colour"
+                    onClick={() => setPalette((p) => (p.includes(color) ? p : [...p, color]))}
+                  >+</button>
+                </div>
+                <div className="cpPalHead">
+                  <span className="cpLabel">Saved palettes</span>
+                  <button
+                    className="cpNew"
+                    onClick={() => {
+                      const name = window.prompt('Name this palette:')
+                      if (name) persistPalettes([...savedPalettes, { name, colors: palette }])
+                    }}
+                  >+ Save current</button>
+                </div>
+                <div className="cpPalList">
+                  {savedPalettes.length === 0 && <div className="cpEmpty">No saved palettes yet.</div>}
+                  {savedPalettes.map((p, i) => (
+                    <div className="cpPal" key={i} onClick={() => setPalette(p.colors)}>
+                      <div className="cpPalTop">
+                        <span className="cpPalName">{p.name}</span>
+                        <button className="cpPalDel" onClick={(e) => { e.stopPropagation(); persistPalettes(savedPalettes.filter((_, k) => k !== i)) }} title="Delete palette">×</button>
+                      </div>
+                      <div className="cpPalRow">
+                        {p.colors.slice(0, 12).map((c, j) => (
+                          <span key={j} className="cpSw" style={{ background: c }} />
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
         </div>
       </main>
-
-      {/* RIGHT panel — colour & output. Content scrolls; the save cluster stays
-          pinned at the bottom so a big palette can't push it away (iPad pass #6). */}
-      <aside className="panel right">
-        <div className="panelScroll">
-
-        {/* Colour */}
-        <div className="card">
-          <div className="cardTitle">Colour</div>
-          <div className="colorTop">
-            <input
-              type="color"
-              value={color}
-              onChange={(e) => setColor(e.target.value)}
-              className="bigSwatch"
-            />
-            <Pill value={color} label="hex" text onChange={(v) => setColor(v)} />
-          </div>
-          {recentColors.length > 0 && (
-            <>
-              <div className="cardTitle small">Recent</div>
-              <div className="swatches">
-                {recentColors.map((c, i) => (
-                  <button
-                    key={i}
-                    className={`sw ${c === color ? 'on' : ''}`}
-                    style={{ background: c }}
-                    onPointerDown={onSwatchDown(c)}
-                    onPointerMove={onSwatchMove}
-                    onPointerUp={onSwatchUp}
-                    onPointerCancel={onSwatchCancel}
-                    title={c}
-                  />
-                ))}
-              </div>
-            </>
-          )}
-          <div className="cardTitle small">Palette</div>
-          <div className="swatches">
-            {palette.map((c, i) => (
-              <button
-                key={i}
-                className={`sw ${c === color ? 'on' : ''}`}
-                style={{ background: c }}
-                onPointerDown={onSwatchDown(c)}
-                onPointerMove={onSwatchMove}
-                onPointerUp={onSwatchUp}
-                onPointerCancel={onSwatchCancel}
-                title={`${c} — tap to pick, drag onto canvas to fill`}
-              />
-            ))}
-            <button
-              className="sw add"
-              title="Add current colour"
-              onClick={() => setPalette((p) => (p.includes(color) ? p : [...p, color]))}
-            >+</button>
-          </div>
-          <button
-            className="ghost"
-            onClick={() => {
-              const name = window.prompt('Name this palette:')
-              if (name) persistPalettes([...savedPalettes, { name, colors: palette }])
-            }}
-          >Save current palette</button>
-          {savedPalettes.length > 0 && (
-            <>
-              <div className="cardTitle small">Saved palettes — click to load</div>
-              <div className="savedList">
-                {savedPalettes.map((p, i) => (
-                  <div className="savedItem" key={i}>
-                    <button
-                      className="savedApply"
-                      onClick={() => setPalette(p.colors)}
-                      title={`Load “${p.name}”`}
-                    >
-                      <span className="savedName">{p.name}</span>
-                      <span className="savedSw">
-                        {p.colors.slice(0, 12).map((c, j) => (
-                          <i key={j} style={{ background: c }} />
-                        ))}
-                      </span>
-                    </button>
-                    <button
-                      className="x"
-                      title="Delete palette"
-                      onClick={() => persistPalettes(savedPalettes.filter((_, k) => k !== i))}
-                    >×</button>
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-
-        {/* This artwork — name + auto-save status + a file to move it elsewhere */}
-        <div className="card">
-          <div className="cardTitle">This artwork</div>
-          <Pill value={designName} label="name" text onChange={setDesignName} />
-          <button className="ghost" onClick={() => setScreen('gallery')}>← My artworks</button>
-          <button className="ghost" onClick={exportDesignFile}>Export this artwork</button>
-          <div className="hint tip">
-            Saves itself automatically. Open another, or manage all your artworks,
-            from My artworks. Export to back up or move to another device.
-          </div>
-        </div>
-
-        {/* Export — PNG chart for the artisan */}
-        <div className="card">
-          <div className="cardTitle">Export — chart PNG</div>
-          <div className="segmented">
-            {[
-              ['transparent', 'Transparent'],
-              ['screen', 'On-screen'],
-            ].map(([id, label]) => (
-              <button
-                key={id}
-                className={`seg ${exportBg === id ? 'on' : ''}`}
-                onClick={() => setExportBg(id)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          <div className="hint">One sheet · outlined beads · numbers + guides every 10 · colour key.</div>
-        </div>
-
-        </div>
-
-        <div className="saveCluster">
-          <button className="primary" onClick={exportPNG}>Save PNG</button>
-          <div className="hint tip">Your work auto-saves. “Save PNG” makes the printable chart for the artisan.</div>
-        </div>
-      </aside>
 
       {/* floating swatch that follows the pointer while dragging a colour */}
       {dragGhost && (
@@ -2723,7 +2840,9 @@ export default function Home() {
             <div className="gallery">
               <div className="galleryHead">
                 <div className="brand big">MY ARTWORKS<span className="dot" /></div>
-                <button className="primary newBtn" onClick={() => createArtwork(DEFAULT_TECHNIQUE)}>+ New artwork</button>
+                <div className="galleryHeadBtns">
+                  <button className="primary newBtn" onClick={() => createArtwork(DEFAULT_TECHNIQUE)}>+ New artwork</button>
+                </div>
               </div>
               {artworks.length === 0 ? (
                 <div className="galleryEmpty">
@@ -2749,13 +2868,10 @@ export default function Home() {
                           {a.thumb ? (
                             <img src={a.thumb} alt="" draggable={false} />
                           ) : (
-                            <span className="artMono">{(a.name || '?')[0].toUpperCase()}</span>
+                            <span className="artBlank">{(a.name || '?')[0].toUpperCase()}</span>
                           )}
                         </div>
-                        <div className="artCardFoot">
-                          <span className="artName">{a.name}</span>
-                          <span className="artMeta">{a.beads} · {timeAgo(a.updatedAt)}</span>
-                        </div>
+                        <span className="artName">{a.name}</span>
                       </div>
                     ))}
                 </div>
@@ -2826,42 +2942,137 @@ export default function Home() {
           transform: translate(-50%, -130%);
           border: 2px solid #ffffff; box-shadow: 0 4px 14px rgba(0,0,0,0.45);
         }
-        .stage {
-          flex: 1; display: flex; flex-direction: column;
-          min-width: 0; min-height: 0;
-        }
-        /* fixed Figma/Photoshop-style pasteboard: fills the work area, no
-           scrollbars. The viewport-sized canvas fills it; pan/zoom is a transform. */
+        .stage { flex: 1; display: flex; min-width: 0; min-height: 0; }
+        /* canvas-first: the pasteboard IS the whole app — no side panels.
+           Fixed Figma/Photoshop-style pasteboard, no scrollbars; pan/zoom is
+           a transform on the viewport-sized canvas. */
         .pasteboard {
           position: relative; flex: 1; min-height: 0; overflow: hidden;
           background: #161618;
         }
         .board { display: block; touch-action: none; cursor: crosshair; }
         .board.grab { cursor: grab; }
+
+        /* ── two floating toolbar pills ── */
+        .tbPill {
+          position: absolute; top: 14px; height: 48px;
+          display: flex; align-items: center; gap: 4px; padding: 0 8px;
+          background: ${T.panel}; border-radius: ${T.radius}px;
+          box-shadow: 0 2px 12px rgba(0,0,0,0.28); z-index: 15;
+        }
+        .tbLeft { left: 14px; }
+        .tbRight { right: 14px; }
+        .tbIcon {
+          width: 42px; height: 42px; display: flex; align-items: center;
+          justify-content: center; border: none; background: none;
+          color: ${T.inkSoft}; border-radius: 10px; cursor: pointer; transition: all 0.12s;
+        }
+        .tbIcon:hover { color: ${T.ink}; background: rgba(128,128,128,0.16); }
+        .tbIcon.on { color: ${T.ink}; background: rgba(128,128,128,0.30); }
+        .tbColor {
+          position: relative; width: 30px; height: 30px; margin-left: 6px; padding: 0;
+          border: 2px solid rgba(255,255,255,0.55); border-radius: 50%;
+          cursor: pointer; touch-action: none;
+        }
+        .tbColor.on { box-shadow: 0 0 0 2px ${T.accent}; }
+
+        /* editable artwork title, above the canvas top-left */
+        .canvasName {
+          position: absolute; top: 72px; left: 22px; z-index: 11;
+          width: auto; max-width: 40vw; background: none; border: none; outline: none;
+          color: ${T.light}; font-family: ${T.mono}; font-size: 18px;
+          letter-spacing: 0.01em; padding: 2px 6px; border-radius: 6px;
+          white-space: nowrap; display: inline-block; cursor: default;
+        }
+        .canvasName.editing {
+          width: 200px; cursor: text; color: ${T.ink};
+          background: ${T.pill}; box-shadow: inset 0 0 0 1px ${T.accent};
+        }
+
+        /* ── left rail: brush size + stitch shape ── */
+        .brushRail {
+          position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
+          display: flex; flex-direction: column; align-items: center; gap: 12px;
+          padding: 16px 10px; background: ${T.panel}; border-radius: ${T.radius}px;
+          box-shadow: 0 2px 12px rgba(0,0,0,0.22); z-index: 12;
+        }
+        /* wide (40px) touch target; a thin painted track keeps it visually slim */
+        .vSlider {
+          -webkit-appearance: none; appearance: none;
+          writing-mode: vertical-lr; direction: rtl;
+          width: 40px; height: 240px; max-height: 36vh;
+          background: transparent;
+          background-image: linear-gradient(${T.track}, ${T.track});
+          background-size: 10px 100%; background-position: center; background-repeat: no-repeat;
+          outline: none; cursor: pointer; touch-action: none;
+        }
+        .vSlider::-webkit-slider-thumb {
+          -webkit-appearance: none; appearance: none;
+          width: 34px; height: 26px; border-radius: 20px; background: ${T.thumb};
+          border: none; cursor: pointer;
+        }
+        .vSlider::-moz-range-track { background: transparent; }
+        .vSlider::-moz-range-thumb {
+          width: 34px; height: 26px; border: none; border-radius: 20px;
+          background: ${T.thumb}; cursor: pointer;
+        }
+        .brushRailVal { font-family: ${T.mono}; font-size: 12px; color: ${T.ink}; }
+        .stitchRail { display: flex; flex-direction: column; gap: 6px; padding-top: 4px;
+          border-top: 1px solid ${T.line}; }
+        .stitchRailBtn {
+          width: 34px; height: 34px; border: none; background: ${T.pill};
+          color: ${T.ink}; border-radius: 9px; cursor: pointer; font-size: 15px;
+        }
+        .stitchRailBtn:hover { background: ${T.hoverPill}; }
+        .stitchRailBtn.on { background: ${T.accent}; color: #fff; }
+
+        /* ── right colour rail (the active palette) ── */
+        .paletteRail {
+          position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+          display: flex; flex-direction: column; align-items: center; gap: 12px;
+          padding: 14px 12px; background: ${T.panel}; border-radius: ${T.radius}px;
+          box-shadow: 0 2px 12px rgba(0,0,0,0.22); z-index: 12;
+          max-height: 78%; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+        }
+        .railSw {
+          flex-shrink: 0; width: 42px; height: 42px; border-radius: 50%; cursor: pointer;
+          border: 2px solid transparent; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.18);
+          touch-action: none;
+        }
+        .railSw.on { border-color: ${T.ink}; }
+
+        /* ── undo / redo (bottom-left) ── */
+        .undoRedo { position: absolute; left: 14px; bottom: 14px; display: flex; gap: 8px; z-index: 12; }
+        .undoRedo button {
+          width: 44px; height: 44px; display: flex; align-items: center; justify-content: center;
+          border: none; background: ${T.panel}; color: ${T.inkSoft};
+          border-radius: 10px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+        .undoRedo button:hover { color: ${T.ink}; background: ${T.hoverPill}; }
+
+        /* ── zoom (bottom-right) ── */
         .zoomCtl {
-          position: absolute; left: 14px; bottom: 14px;
+          position: absolute; right: 14px; bottom: 14px;
           display: flex; align-items: center; gap: 2px;
-          background: ${T.panelSolid};
-          border-radius: 14px; padding: 4px;
-          box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+          background: ${T.panel}; border-radius: ${T.radius}px; padding: 3px;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.2); z-index: 12;
         }
         .zoomCtl button {
           border: none; background: none; color: ${T.ink}; cursor: pointer;
-          font-family: ${T.mono}; font-size: 14px; width: 30px; height: 26px;
-          border-radius: 4px;
+          font-family: ${T.mono}; font-size: 15px; width: 40px; height: 40px;
+          border-radius: 8px;
         }
-        .zoomCtl button:hover { background: #34343a; }
-        .zoomCtl .zval { width: 54px; font-size: 11px; }
-        .zsep { width: 1px; height: 18px; background: ${T.line}; margin: 0 3px; }
+        .zoomCtl button:hover { background: ${T.hoverPill}; }
+        .zoomCtl .zval { width: 56px; font-size: 12px; }
 
         /* image-adjust mode banner */
         .adjustBar {
-          position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+          position: absolute; top: 74px; left: 50%; transform: translateX(-50%);
           display: flex; align-items: center; gap: 12px;
           background: ${T.panelSolid}; border: 1px solid ${T.accent};
           border-radius: ${T.radius}px; padding: 8px 12px;
           font-family: ${T.mono}; font-size: 9px; letter-spacing: 0.08em;
-          color: ${T.ink}; white-space: nowrap;
+          color: ${T.ink}; white-space: nowrap; z-index: 16;
         }
         .adjustBar button {
           border: none; background: ${T.accent}; color: #fff; cursor: pointer;
@@ -2869,189 +3080,213 @@ export default function Home() {
           letter-spacing: 0.08em; padding: 6px 14px; border-radius: 4px;
         }
 
-        /* floating Draw/Erase/Select strip — right edge, ≥44px touch targets */
-        .toolStrip {
-          position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
-          display: flex; flex-direction: column; gap: 5px;
-          background: ${T.panelSolid};
-          border-radius: 18px; padding: 6px;
-          box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+        /* active-layer-not-editable banner */
+        .lockNote {
+          position: absolute; top: 74px; left: 50%; transform: translateX(-50%);
+          background: ${T.panelSolid}; border: 1px solid ${T.accent};
+          border-radius: ${T.radius}px; padding: 8px 12px;
+          font-family: ${T.mono}; font-size: 10px; letter-spacing: 0.04em;
+          color: ${T.ink}; line-height: 1.5; z-index: 16; white-space: nowrap;
         }
-        .stripBtn {
-          width: 56px; height: 56px;
-          display: flex; flex-direction: column; align-items: center;
-          justify-content: center; gap: 4px;
-          border: none; background: none; color: ${T.inkSoft};
-          border-radius: 5px; cursor: pointer;
-          font-family: ${T.mono}; font-size: 8px; text-transform: uppercase;
-          letter-spacing: 0.08em; transition: all 0.12s;
-        }
-        .stripBtn:hover { color: ${T.ink}; background: #34343a; }
-        .stripBtn.on {
-          color: ${T.ink}; background: #2f2f35;
-          box-shadow: inset 0 0 0 1px ${T.accent};
-        }
-        .stripBtn.on svg { color: ${T.accent}; }
-        .stripSep { height: 1px; background: ${T.line}; margin: 3px 6px; }
 
-        /* floating Procreate-style layers panel */
+        /* ── selection tools — compact bottom-centre bar ── */
+        .selPanel {
+          position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
+          display: flex; flex-direction: column; gap: 8px; z-index: 16;
+          background: ${T.bg}; border-radius: ${T.radius}px; padding: 12px 14px;
+          box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+        }
+        .selRow { display: flex; align-items: center; justify-content: center; gap: 8px; }
+        .selPatternLbl { font-family: ${T.mono}; font-size: 12px; color: ${T.light}; flex-shrink: 0; }
+        .selChip {
+          border: none; background: ${T.panel}; color: ${T.ink}; cursor: pointer;
+          border-radius: ${T.radius}px; padding: 8px 14px; font-family: ${T.mono};
+          font-size: 12px; white-space: nowrap;
+        }
+        .selChip:hover:not(:disabled) { background: ${T.hoverPill}; }
+        .selChip:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        /* ── layers panel ── */
         .layersPanel {
-          position: absolute; right: 84px; top: 50%; transform: translateY(-50%);
-          width: 260px; max-height: 78%;
-          display: flex; flex-direction: column;
-          background: ${T.panelSolid};
-          border-radius: 18px; padding: 10px;
-          box-shadow: 0 12px 34px rgba(0,0,0,0.5); z-index: 20;
+          position: absolute; right: 92px; top: 74px; bottom: 14px;
+          width: 340px; max-width: 76vw;
+          display: flex; flex-direction: column; gap: 12px;
+          background: ${T.bg}; border: 1px solid ${T.line};
+          border-radius: ${T.radius}px; padding: 14px;
+          box-shadow: 0 14px 36px rgba(0,0,0,0.5); z-index: 20;
         }
-        .layersHead {
-          display: flex; align-items: center; justify-content: space-between;
-          font-family: ${T.mono}; font-size: 10px; letter-spacing: 0.12em;
-          color: ${T.inkSoft}; padding: 2px 4px 8px;
+        .lpHead { display: flex; align-items: center; justify-content: space-between; }
+        .lpTitle { font-family: ${T.mono}; font-size: 20px; color: ${T.ink}; }
+        .lpAddBtn {
+          border: none; background: none; color: ${T.ink}; cursor: pointer;
+          width: 36px; height: 36px; border-radius: 8px; font-size: 22px; line-height: 1;
+          display: flex; align-items: center; justify-content: center; padding: 0;
         }
-        .lpAdd {
-          border: none; background: ${T.pill}; color: ${T.ink}; cursor: pointer;
-          width: 24px; height: 24px; border-radius: 6px; font-size: 17px; line-height: 1;
+        .lpAddBtn:hover { background: ${T.hoverPill}; }
+        .lpList {
+          flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 6px;
+          overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
         }
-        .lpAdd:hover { background: #34343a; }
-        .layersList {
-          display: flex; flex-direction: column; gap: 4px;
-          overflow-y: auto; -webkit-overflow-scrolling: touch; min-height: 0;
-          overscroll-behavior: contain; /* a swipe inside the list must not rubber-band the page behind it */
+        .lpRow {
+          flex-shrink: 0; display: flex; align-items: center; gap: 10px;
+          height: 52px; padding: 0 10px 0 6px; border-radius: 8px; cursor: pointer;
+          background: ${T.rowBg};
         }
-        .layerRow {
-          display: flex; align-items: center; gap: 6px;
-          background: ${T.pill}; border-radius: 7px; padding: 7px 8px;
-          cursor: pointer; border: 1px solid transparent; transition: background 0.12s;
-        }
-        .layerRow:hover { background: #34343a; }
-        .layerRow.on { border-color: ${T.accent}; background: #2f2f35; }
-        .layerRow.grouped { margin-left: 14px; } /* indent under its group header */
+        .lpRow.active { background: ${T.rowActive}; }
+        .lpRow.inGroup { margin-left: 16px; }
         .lpThumb {
-          flex-shrink: 0; width: 34px; height: 24px; border-radius: 4px; overflow: hidden;
-          background: #ffffff; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08);
+          flex-shrink: 0; width: 46px; height: 36px; border-radius: 6px;
+          background: ${T.artboard}; overflow: hidden;
         }
         .lpThumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
-        .lpThumbEmpty { display: block; width: 100%; height: 100%; }
-        .lpEye, .lpLock, .lpChevron, .lpFlatten {
-          flex-shrink: 0; border: none; background: none; cursor: pointer;
-          color: ${T.inkSoft}; display: flex; align-items: center; padding: 2px;
-        }
-        .lpEye:hover, .lpLock:hover, .lpChevron:hover { color: ${T.ink}; }
         .lpName {
-          flex: 1; min-width: 0; font-family: ${T.mono}; font-size: 11px;
-          color: ${T.ink}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-          display: flex; align-items: baseline; gap: 6px;
+          flex: 1; min-width: 0; font-family: ${T.mono}; font-size: 14px;
+          color: ${T.rowInk}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
-        .lpLockTag { font-size: 8px; font-style: normal; color: ${T.inkSoft};
-          text-transform: uppercase; letter-spacing: 0.08em; }
-        .lpCount { flex-shrink: 0; font-family: ${T.mono}; font-size: 9px; color: ${T.inkSoft}; margin-left: 4px; }
-        /* collapsible group header — same row language, sits above its members */
-        .groupHeader {
-          display: flex; align-items: center; gap: 6px;
-          background: #232327; border-radius: 7px; padding: 7px 8px;
-          border: 1px solid ${T.line};
+        .lpRow.active .lpName { color: ${T.rowActiveInk}; }
+        .lpGroupCount { color: ${T.inkSoft}; font-size: 11px; }
+        .lpRowIcon {
+          flex-shrink: 0; border: none; background: none; cursor: pointer;
+          color: ${T.rowInk}; display: flex; align-items: center; justify-content: center;
+          padding: 0; width: 34px; height: 34px; border-radius: 8px; font-family: ${T.mono};
         }
-        .lpChevron { font-size: 11px; width: 14px; justify-content: center; }
-        .lpMemberCount { font-size: 9px; font-style: normal; color: ${T.inkSoft}; flex-shrink: 0; }
-        .lpFlatten {
-          font-family: ${T.mono}; font-size: 8.5px; text-transform: uppercase;
-          letter-spacing: 0.04em; padding: 3px 6px; border-radius: 5px; background: ${T.pill};
+        .lpRow.active .lpRowIcon { color: ${T.rowActiveInk}; }
+        .lpRowIcon:hover { background: rgba(128,128,128,0.18); }
+        .lpRowIcon.on { background: ${T.accent}; color: #fff; }
+        /* group header row */
+        .lpGroupRow { background: ${T.pill}; }
+        .lpChevron {
+          width: 16px; text-align: center; color: ${T.inkSoft}; font-size: 11px;
+          transition: transform 0.12s ease; flex-shrink: 0;
         }
-        .lpFlatten:hover { background: #34343a; color: ${T.ink}; }
-        .layerActions {
-          display: flex; flex-wrap: wrap; gap: 4px; padding-top: 8px; margin-top: 6px;
-          border-top: 1px solid ${T.line};
+        .lpChevron.open { transform: rotate(90deg); }
+        .lpEditBtn {
+          flex-shrink: 0; border: none; background: none; color: ${T.rowInk}; cursor: pointer;
+          padding: 6px 8px; border-radius: 6px; font-family: ${T.mono}; font-size: 10px;
+          text-transform: uppercase; letter-spacing: 0.04em;
         }
-        .layerActions button {
-          flex: 1 1 28%; min-width: 0; border: none; background: ${T.pill}; color: ${T.ink};
-          cursor: pointer; border-radius: 6px; padding: 7px 2px;
-          font-family: ${T.mono}; font-size: 9px; letter-spacing: 0.02em;
+        .lpEditBtn:hover { background: rgba(128,128,128,0.18); }
+        /* bottom action bar: light strip, dark text, dividers */
+        .lpBar {
+          flex-shrink: 0; display: flex; align-items: center; flex-wrap: wrap;
+          background: ${T.artboard}; border-radius: 8px; overflow: hidden;
         }
-        .layerActions button:hover { background: #34343a; }
-        .layerActions button:disabled { opacity: 0.3; cursor: not-allowed; }
-        .lpHint { font-family: ${T.mono}; font-size: 8.5px; color: ${T.inkSoft};
-          line-height: 1.5; padding: 8px 4px 2px; }
+        .lpBar button {
+          flex: 1 1 auto; min-width: 0; border: none; background: none; color: ${T.darkInk};
+          cursor: pointer; height: 44px; padding: 0 6px;
+          font-family: ${T.mono}; font-size: 11px;
+        }
+        .lpBar button:hover:not(:disabled) { background: rgba(0,0,0,0.06); }
+        .lpBar button.on { background: ${T.accent} !important; color: #fff !important; }
+        .lpBar button:disabled { opacity: 0.35; cursor: not-allowed; }
+        .lpBarDiv { width: 1px; height: 20px; background: rgba(51,51,50,0.25); flex-shrink: 0; }
 
-        /* active-layer-not-editable banner (left panel) */
-        .lockNote {
-          background: #2f2f35; border: 1px solid ${T.accent};
-          border-radius: ${T.radius}px; padding: 8px 10px;
-          font-family: ${T.mono}; font-size: 9px; letter-spacing: 0.04em;
-          color: ${T.ink}; line-height: 1.5;
+        /* ── ☰ dropdown menu ── */
+        .menuScrim { position: absolute; inset: 0; z-index: 30; }
+        .menuPop {
+          position: absolute; top: 62px; left: 20px; width: 220px; z-index: 31;
+          display: flex; flex-direction: column; padding: 6px;
+          background: ${T.panelSolid}; border: 1px solid ${T.line};
+          border-radius: ${T.radius}px; box-shadow: 0 12px 30px rgba(0,0,0,0.45);
         }
-        .stageInfo {
-          flex-shrink: 0; color: ${T.inkSoft}; font-size: 10px; font-family: ${T.mono};
-          text-transform: uppercase; letter-spacing: 0.08em;
-          padding: 9px 16px; border-top: 1px solid ${T.line}; background: ${T.bg};
+        .menuItem {
+          border: none; background: none; color: ${T.ink}; cursor: pointer;
+          text-align: left; padding: 11px 12px; border-radius: 6px;
+          font-family: ${T.mono}; font-size: 13px; letter-spacing: 0.01em;
+        }
+        .menuItem:hover { background: ${T.hoverPill}; }
+        .menuDiv { height: 1px; background: ${T.line}; margin: 2px 8px; }
+
+        /* ── Artwork Details modal ── */
+        .modalScrim {
+          position: fixed; inset: 0; z-index: 60; display: flex;
+          align-items: center; justify-content: center; padding: 24px;
+          background: rgba(0,0,0,0.55);
+        }
+        .detailsModal {
+          width: 100%; max-width: 460px; max-height: 84vh;
+          display: flex; flex-direction: column;
+          background: ${T.panel}; border: 1px solid ${T.line};
+          border-radius: ${T.radius}px; box-shadow: 0 20px 60px rgba(0,0,0,0.55);
+          overflow: hidden;
+        }
+        .detailsHead {
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 16px 18px; border-bottom: 1px solid ${T.line};
+        }
+        .detailsTitle { font-family: ${T.mono}; font-size: 18px; color: ${T.ink}; }
+        .detailsScroll {
+          display: flex; flex-direction: column; gap: 12px; padding: 16px 18px 20px;
+          overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+        }
+        .drawerClose {
+          border: none; background: none; color: ${T.inkSoft};
+          font-size: 24px; line-height: 1; cursor: pointer; padding: 0 4px;
+        }
+        .drawerClose:hover { color: ${T.ink}; }
+        .drawerInfo {
+          font-family: ${T.mono}; font-size: 11px; color: ${T.inkSoft};
+          line-height: 1.6; letter-spacing: 0.02em; padding: 4px 2px;
         }
 
-        .panel {
-          width: 264px; flex-shrink: 0;
-          background: ${T.panel};
-          padding: 20px 16px; overflow: hidden;
-          display: flex; flex-direction: column; gap: 13px;
+        /* ── colour picker panel ── */
+        .colorPanel {
+          position: absolute; top: 74px; right: 14px; bottom: 14px; width: 300px; max-width: 88vw;
+          z-index: 31;
+          display: flex; flex-direction: column; gap: 12px; padding: 16px;
+          background: ${T.bg}; border: 1px solid ${T.line};
+          border-radius: ${T.radius}px; box-shadow: 0 14px 36px rgba(0,0,0,0.5);
+          overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
         }
-        .panel.left { border-right: 1px solid ${T.line}; }
-        .panel.right { border-left: 1px solid ${T.line}; }
-        /* both panels: cards scroll, the pinned cluster below stays visible */
-        .panelScroll {
-          flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
-          -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
-          display: flex; flex-direction: column; gap: 11px;
+        .cpHead { display: flex; align-items: center; justify-content: space-between; }
+        .cpTitle { font-family: ${T.mono}; font-size: 20px; color: ${T.ink}; }
+        .cpLabel { font-family: ${T.mono}; font-size: 13px; color: ${T.inkSoft}; }
+        .cpBox {
+          display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+          background: ${T.pill}; border-radius: 8px; padding: 8px 10px;
         }
-        .saveCluster {
-          flex-shrink: 0; display: flex; flex-direction: column; gap: 7px;
-          padding-top: 11px; border-top: 1px solid ${T.line};
+        .cpSw {
+          width: 28px; height: 28px; border-radius: 50%; cursor: pointer;
+          border: 2px solid transparent; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.18);
+          flex-shrink: 0;
         }
-        .brand {
-          font-size: 18px; font-weight: 700; letter-spacing: 0.04em;
-          font-family: ${T.mono}; display: inline-flex; align-items: center;
+        .cpSw.on { border-color: ${T.ink}; }
+        .cpSw.add {
+          background: rgba(128,128,128,0.12); border: 1px dashed ${T.line};
+          color: ${T.inkSoft}; font-size: 15px; line-height: 1;
         }
-        .dot {
-          width: 8px; height: 8px; border-radius: 50%;
-          background: ${T.accent}; margin-left: 7px;
+        .cpSw.add:hover { color: ${T.ink}; }
+        .cpPalHead { display: flex; align-items: center; justify-content: space-between; margin-top: 2px; }
+        .cpNew {
+          border: none; background: ${T.pill}; color: ${T.inkSoft}; cursor: pointer;
+          border-radius: 6px; padding: 5px 11px; font-family: ${T.mono}; font-size: 12px;
         }
-        .sub { color: ${T.inkSoft}; font-size: 10px; margin-top: -8px;
-          font-family: ${T.mono}; letter-spacing: 0.12em; }
+        .cpNew:hover { background: ${T.hoverPill}; color: ${T.ink}; }
+        .cpPalList { display: flex; flex-direction: column; gap: 8px; }
+        .cpEmpty { font-family: ${T.mono}; font-size: 11px; color: ${T.inkSoft}; }
+        .cpPal {
+          background: ${T.pill}; cursor: pointer;
+          border-radius: 8px; padding: 9px 10px; display: flex; flex-direction: column; gap: 8px;
+        }
+        .cpPal:hover { background: ${T.hoverPill}; }
+        .cpPalTop { display: flex; align-items: center; justify-content: space-between; }
+        .cpPalName { font-family: ${T.mono}; font-size: 12px; color: ${T.ink}; }
+        .cpPalDel { border: none; background: none; color: ${T.inkSoft}; cursor: pointer; font-size: 15px; }
+        .cpPalDel:hover { color: ${T.accent}; }
+        .cpPalRow { display: flex; flex-wrap: wrap; gap: 4px; }
+        .cpPalRow .cpSw { width: 16px; height: 16px; cursor: default; }
 
-        .tip { color: ${T.inkSoft}; opacity: 0.8; }
-
-        /* brush size slider */
-        .brushRow { display: flex; align-items: center; gap: 10px; padding: 2px 2px; }
-        .brushLabel { font-family: ${T.mono}; font-size: 10px; text-transform: uppercase;
-          letter-spacing: 0.1em; color: ${T.inkSoft}; }
-        .brushVal { font-family: ${T.mono}; font-size: 12px; color: ${T.ink}; width: 12px; text-align: right; }
-        .stitchSeg { flex: 1; gap: 4px; }
-        .stitchSeg.segmented .seg { padding: 8px 2px; font-size: 10px; }
-        /* min-width: 0 — a range input refuses to flex-shrink below its ~129px
-           built-in size otherwise, which made the left panel scroll sideways */
-        .slider { flex: 1; min-width: 0; -webkit-appearance: none; appearance: none; height: 3px;
-          background: ${T.line}; border-radius: 3px; outline: none; }
-        .slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none;
-          width: 14px; height: 14px; border-radius: 50%; background: ${T.ink}; cursor: pointer; }
-        .slider::-moz-range-thumb { width: 14px; height: 14px; border: none; border-radius: 50%;
-          background: ${T.ink}; cursor: pointer; }
-
-        /* selection actions */
-        .selCard .pillRow { gap: 7px; }
-        .ghost:disabled { opacity: 0.35; cursor: not-allowed; }
-        .ghost:disabled:hover { background: ${T.pill}; }
-
-        /* accessibility: clear keyboard focus ring on every control */
-        .panel button:focus-visible, .panel input:focus-visible,
-        .panel label:focus-within { outline: 2px solid ${T.accent}; outline-offset: 1px; }
-
+        /* shared card / pill / button language (Artwork Details, Colours) */
         .card {
-          background: ${T.panelSolid};
-          border-radius: 16px;
-          padding: 16px; display: flex; flex-direction: column; gap: 11px;
+          background: ${T.panelSolid}; border-radius: 14px;
+          padding: 14px; display: flex; flex-direction: column; gap: 9px;
         }
         .cardTitle { font-size: 10px; font-weight: 600; color: ${T.inkSoft};
           font-family: ${T.mono}; text-transform: uppercase; letter-spacing: 0.1em; }
-        .cardTitle.small { margin-top: 4px; }
-        .hint { font-size: 10px; color: ${T.inkSoft}; font-family: ${T.mono};
+        .cardTitle.small { margin-top: 2px; }
+        .hint { font-size: 11px; color: ${T.inkSoft}; font-family: ${T.mono};
           letter-spacing: 0.02em; line-height: 1.5; }
-
+        .tip { opacity: 0.8; }
         .segmented { display: flex; gap: 6px; }
         .seg {
           flex: 1; padding: 9px 6px; border: none;
@@ -3059,51 +3294,26 @@ export default function Home() {
           border-radius: 9px; cursor: pointer; font-size: 13px; font-weight: 600;
           transition: background 0.12s;
         }
-        .seg:hover { background: #34343a; }
+        .seg:hover { background: ${T.hoverPill}; }
         .seg.on { background: ${T.active}; color: ${T.activeInk}; }
-
         .pillRow { display: flex; gap: 8px; }
-
         .colorTop { display: flex; gap: 10px; align-items: center; }
         .bigSwatch {
-          width: 52px; height: 52px; padding: 0; border: 1px solid ${T.line};
-          border-radius: 14px; background: none; cursor: pointer;
+          width: 48px; height: 48px; padding: 0; border: 1px solid ${T.line};
+          border-radius: 12px; background: none; cursor: pointer;
         }
-        .swatches { display: flex; flex-wrap: wrap; gap: 7px; }
-        .sw {
-          width: 28px; height: 28px; border-radius: 9px; cursor: pointer;
-          border: 2px solid transparent; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.08);
-          touch-action: none; /* a finger on a swatch drags colour, not the panel */
-        }
-        .sw.on { border-color: ${T.ink}; }
-        .sw.add {
-          background: ${T.pill}; color: ${T.inkSoft}; border: 1px dashed ${T.line};
-          font-size: 16px; line-height: 1;
-        }
-        .savedList { display: flex; flex-direction: column; gap: 5px;
-          max-height: 168px; overflow-y: auto; overscroll-behavior: contain; }
-        .savedItem { display: flex; align-items: stretch; gap: 4px; }
-        .savedApply {
-          flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px;
-          background: ${T.pill}; border: none; border-radius: 8px; padding: 7px 9px;
-          cursor: pointer; text-align: left; transition: background 0.12s;
-        }
-        .savedApply:hover { background: #34343a; }
-        .savedName { font-family: ${T.mono}; font-size: 10px; color: ${T.ink};
-          text-transform: uppercase; letter-spacing: 0.06em; }
-        .savedSw { display: flex; flex-wrap: wrap; gap: 3px; }
-        .savedSw i { width: 14px; height: 14px; border-radius: 3px; display: block;
-          box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08); }
-        .x { background: none; border: none; color: ${T.inkSoft}; cursor: pointer;
-          font-size: 16px; padding: 0 5px; }
-        .x:hover { color: ${T.accent}; }
-
-        .ghost, .fileBtn {
+        .ghost {
           padding: 10px; border: none; background: ${T.pill};
           color: ${T.ink}; border-radius: 10px; cursor: pointer; font-size: 13px;
           font-weight: 600; text-align: center; display: block; transition: background 0.12s;
         }
-        .ghost:hover, .fileBtn:hover { background: #34343a; }
+        .ghost:hover { background: ${T.hoverPill}; }
+        .fileBtn {
+          padding: 10px; border: none; background: ${T.pill};
+          color: ${T.ink}; border-radius: 10px; cursor: pointer; font-size: 13px;
+          font-weight: 600; text-align: center; display: block; transition: background 0.12s;
+        }
+        .fileBtn:hover { background: ${T.hoverPill}; }
         .ghost.half { flex: 1; min-width: 0; }
         .primary {
           padding: 14px; border: none; cursor: pointer;
@@ -3114,54 +3324,25 @@ export default function Home() {
         }
         .primary:hover { opacity: 0.88; }
 
-        /* technique chooser modal */
-        .modalScrim {
-          position: fixed; inset: 0; z-index: 60; display: flex;
-          align-items: center; justify-content: center; padding: 24px;
-          background: rgba(0,0,0,0.72);
-          background-image: radial-gradient(${T.line} 1px, transparent 1px);
-          background-size: 16px 16px;
-        }
-        .modal {
-          width: 100%; max-width: 460px; display: flex; flex-direction: column; gap: 14px;
-          background: ${T.panelSolid}; border: 1px solid ${T.line};
-          border-radius: ${T.radius}px; padding: 22px;
-          box-shadow: 0 20px 60px rgba(0,0,0,0.6);
-        }
-        .modalTitle { font-family: ${T.mono}; font-size: 12px; font-weight: 700;
-          letter-spacing: 0.14em; color: ${T.ink};
-          display: flex; align-items: center; gap: 8px; }
-        .modalTitle::after { content: ''; width: 7px; height: 7px; border-radius: 50%;
-          background: ${T.accent}; }
-        .modalSub { font-family: ${T.mono}; font-size: 10px; line-height: 1.6;
-          color: ${T.inkSoft}; }
-        .techGrid { display: flex; gap: 12px; flex-wrap: wrap; }
-        .techCard {
-          flex: 1; min-width: 160px; text-align: left; cursor: pointer;
-          display: flex; flex-direction: column; gap: 7px;
-          background: ${T.pill}; border: 1px solid ${T.line};
-          border-radius: 10px; padding: 16px; transition: all 0.12s;
-        }
-        .techCard:hover { background: #34343a; border-color: ${T.inkSoft}; }
-        .techCard.on { border-color: ${T.accent}; }
-        .techName { font-size: 14px; font-weight: 700; color: ${T.ink}; }
-        .techDesc { font-family: ${T.mono}; font-size: 10px; line-height: 1.5; color: ${T.inkSoft}; }
-
-        /* My artworks gallery (covers the editor when not editing) */
+        /* ── My artworks gallery (covers the editor when not editing) ── */
         .galleryScrim {
           position: fixed; inset: 0; z-index: 50; display: flex;
-          align-items: flex-start; justify-content: center; overflow-y: auto;
+          align-items: flex-start; justify-content: center; overflow-y: auto; overscroll-behavior: contain;
           padding: 40px 24px; background: ${T.bg};
         }
         .galleryLoading {
           margin-top: 18vh; font-family: ${T.mono}; font-size: 12px;
           letter-spacing: 0.1em; color: ${T.inkSoft};
         }
-        .gallery {
-          width: 100%; max-width: 640px; display: flex; flex-direction: column; gap: 16px;
-        }
+        .gallery { width: 100%; max-width: 900px; display: flex; flex-direction: column; gap: 18px; }
         .galleryHead { display: flex; align-items: center; justify-content: space-between; }
+        .brand {
+          font-size: 18px; font-weight: 700; letter-spacing: 0.04em;
+          font-family: ${T.mono}; display: inline-flex; align-items: center; color: ${T.ink};
+        }
         .brand.big { font-size: 22px; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: ${T.accent}; margin-left: 7px; }
+        .galleryHeadBtns { display: flex; gap: 8px; }
         .newBtn { width: auto; padding: 12px 18px; }
         .galleryEmpty {
           font-family: ${T.mono}; font-size: 12px; line-height: 1.7; color: ${T.inkSoft};
@@ -3172,30 +3353,26 @@ export default function Home() {
         /* Procreate-style thumbnail card grid: tap opens, hold/right-click
            opens the artMenu instead of always-visible action buttons */
         .galleryGrid {
-          display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-          gap: 14px;
+          display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+          gap: 18px 16px;
         }
         .artCard {
-          display: flex; flex-direction: column; gap: 7px; cursor: pointer;
+          display: flex; flex-direction: column; gap: 8px; cursor: pointer;
           -webkit-user-select: none; user-select: none; touch-action: manipulation;
         }
         .artThumb {
-          aspect-ratio: 10 / 7; border-radius: 12px; overflow: hidden;
-          background: ${T.panelSolid}; border: 1px solid ${T.line};
+          aspect-ratio: 4 / 3; border-radius: ${T.radius}px; overflow: hidden;
+          background: ${T.artboard}; border: 1px solid ${T.line};
           display: flex; align-items: center; justify-content: center;
-          transition: border-color 0.12s, transform 0.08s;
+          transition: border-color 0.12s, transform 0.08s, box-shadow 0.12s;
         }
+        .artCard:hover .artThumb { box-shadow: 0 6px 22px rgba(0,0,0,0.35); }
         .artCard:active .artThumb { transform: scale(0.97); border-color: ${T.accent}; }
-        .artThumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
-        .artMono {
-          font-family: ${T.mono}; font-size: 26px; font-weight: 700; color: ${T.inkSoft};
-        }
-        .artCardFoot { display: flex; flex-direction: column; gap: 2px; padding: 0 2px; }
-        .artName { font-size: 13px; font-weight: 700; color: ${T.ink};
+        .artThumb img { max-width: 100%; max-height: 100%; object-fit: contain; pointer-events: none; }
+        .artBlank { font-family: ${T.mono}; font-size: 30px; color: ${T.thumb}; }
+        .artName { font-size: 13px; font-weight: 600; color: ${T.ink}; text-align: center;
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .artMeta { font-family: ${T.mono}; font-size: 9px; color: ${T.inkSoft};
-          text-transform: uppercase; letter-spacing: 0.04em; }
-        .galleryFoot { display: flex; gap: 8px; }
+        .galleryFoot { display: flex; gap: 8px; justify-content: flex-end; padding-top: 4px; }
         .galleryHint { text-align: center; }
 
         /* long-press / right-click card menu */
@@ -3206,8 +3383,8 @@ export default function Home() {
         }
         .artMenu button {
           border: none; background: none; color: ${T.ink}; cursor: pointer;
-          font-family: ${T.mono}; font-size: 11px; text-transform: uppercase;
-          letter-spacing: 0.04em; padding: 10px 11px; border-radius: 7px; text-align: left;
+          font-family: ${T.mono}; font-size: 12px;
+          padding: 10px 11px; border-radius: 7px; text-align: left;
         }
         .artMenu button:hover { background: ${T.pill}; }
         .artMenu button.del:hover { color: #fff; background: ${T.accent}; }
