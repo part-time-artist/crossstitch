@@ -811,36 +811,44 @@ export default function Home() {
       if (!cells.length) return
       const val = encodeBead(color, stitchStyle)
       const alphaLocked = mode !== 'erase' && !!activeLayer?.alphaLock
+      const prev = beadsRef.current
+      // Freehand strokes call this on every pointer event (up to ~240Hz).
+      // Clone the stroke's base Map ONCE (lazily, on the first real change)
+      // and keep mutating that same private copy in place for the rest of
+      // the stroke, instead of `new Map(prev)` on every event — that clone
+      // was the dominant per-event cost on a dense design. Reset at stroke
+      // start/end (onPointerDown / endDrag).
+      let next = strokeWorking.current
       let changed = false
-      applyBeads((prev) => {
-        // Freehand strokes call this on every pointer event (up to ~240Hz).
-        // Clone the stroke's base Map ONCE (lazily, on the first real change)
-        // and keep mutating that same private copy in place for the rest of
-        // the stroke, instead of `new Map(prev)` on every event — that clone
-        // was the dominant per-event cost on a dense design. Reset at stroke
-        // start/end (onPointerDown / endDrag).
-        let next = strokeWorking.current
-        for (const { col, row } of cells) {
-          const k = key(col, row)
-          if (mode === 'erase') {
-            if ((next || prev).has(k)) {
-              if (!next) { next = new Map(prev); strokeWorking.current = next }
-              next.delete(k)
-              changed = true
-            }
-          } else if (alphaLocked && !(next || prev).has(k)) {
-            continue // alpha lock: only recolour existing stitches, never add new ones
-          } else if ((next || prev).get(k) !== val) {
+      for (const { col, row } of cells) {
+        const k = key(col, row)
+        if (mode === 'erase') {
+          if ((next || prev).has(k)) {
             if (!next) { next = new Map(prev); strokeWorking.current = next }
-            next.set(k, val)
+            next.delete(k)
             changed = true
           }
+        } else if (alphaLocked && !(next || prev).has(k)) {
+          continue // alpha lock: only recolour existing stitches, never add new ones
+        } else if ((next || prev).get(k) !== val) {
+          if (!next) { next = new Map(prev); strokeWorking.current = next }
+          next.set(k, val)
+          changed = true
         }
-        return next || prev
-      }, true) // silent: strokes repaint via rAF, no React render per event
-      if (changed && soundOn) playStitchTick(mode === 'erase' ? 'erase' : 'place')
+      }
+      if (!changed) return
+      // Bypass applyBeads' `next === beadsRef.current` bail check: once
+      // strokeWorking exists, next IS beadsRef.current (mutated in place, same
+      // reference) on every later call this stroke, so that check would always
+      // (wrongly) look like "nothing changed" and skip the redraw — this is
+      // exactly what silently dropped the live in-progress stroke. changed is
+      // this call's own ground truth, computed above.
+      beadsRef.current = next
+      patternBaseRef.current = null
+      requestRedraw()
+      if (soundOn) playStitchTick(mode === 'erase' ? 'erase' : 'place')
     },
-    [brushCells, color, stitchStyle, applyBeads, soundOn, activeLayer]
+    [brushCells, color, stitchStyle, soundOn, activeLayer, requestRedraw]
   )
 
   // ---- selection (marquee Select tool) ----
